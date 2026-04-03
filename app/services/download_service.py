@@ -17,6 +17,7 @@ import httpx
 from app import config as cfg
 from app import state
 from app.services import http_client
+from app.utils.file_ops import replace_or_move_overwrite
 from app.utils.filename import sanitize_filename_for_windows
 from app.utils.paths import FFMPEG, N_M3U8DL_RE
 from app.utils.process import stderr_tail, subprocess_exit_code
@@ -101,19 +102,6 @@ def m3u8_static_header_args() -> list:
         "--header",
         "Accept-Language: ja,en-US;q=0.9,en;q=0.8",
     ]
-
-
-def _replace_or_move_overwrite(src: str, dst: str) -> None:
-    import shutil
-
-    try:
-        os.replace(src, dst)
-    except OSError:
-        shutil.copy2(src, dst)
-        try:
-            os.remove(src)
-        except OSError:
-            pass
 
 
 def is_direct_progressive_http_url(url: str) -> bool:
@@ -518,7 +506,7 @@ async def run_download(
                     os.path.normpath(raw_output)
                 ) != os.path.normcase(os.path.normpath(output_path)):
                     try:
-                        _replace_or_move_overwrite(raw_output, output_path)
+                        replace_or_move_overwrite(raw_output, output_path)
                         logger.info(
                             "Renamed %s → %s",
                             os.path.basename(raw_output),

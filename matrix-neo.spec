@@ -28,6 +28,9 @@ a = Analysis(
         'uvicorn.lifespan',
         'uvicorn.lifespan.on',
         'main',
+        'app.utils.file_ops',
+        'app.utils.url_connection',
+        'app.utils.rate_limit',
             ]
             + hiddenimports_uv
             + hiddenimports_fa

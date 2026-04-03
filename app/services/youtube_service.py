@@ -21,6 +21,7 @@ from app.utils.paths import YTDLP
 logger = logging.getLogger(__name__)
 
 _YT_JSON_CACHE: dict[str, tuple[dict, float]] = {}
+_YT_JSON_CACHE_MAX = 100
 _YT_META_TTL = 300.0
 
 
@@ -47,6 +48,9 @@ async def fetch_youtube_json(url: str) -> dict:
         raise HTTPException(status_code=400, detail="Failed to get video info")
     data = json.loads(stdout.decode("utf-8"))
     _YT_JSON_CACHE[url] = (data, now)
+    if len(_YT_JSON_CACHE) > _YT_JSON_CACHE_MAX:
+        oldest_key = min(_YT_JSON_CACHE, key=lambda k: _YT_JSON_CACHE[k][1])
+        del _YT_JSON_CACHE[oldest_key]
     return data
 
 _RE_YT_PROGRESS = re.compile(r"\[download\]\s+(\d+\.?\d*)%")

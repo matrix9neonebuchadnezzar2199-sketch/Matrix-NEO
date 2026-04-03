@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 @router.get("/youtube/info")
 async def youtube_info(url: str):
-    validate_http_url(url, block_private_ips=cfg.BLOCK_PRIVATE_IPS)
+    _url, _ = validate_http_url(url, block_private_ips=cfg.BLOCK_PRIVATE_IPS)
     try:
         info = await youtube_service.fetch_youtube_json(url)
         video_qualities = set()
@@ -51,7 +51,7 @@ async def youtube_info(url: str):
 
 @router.post("/youtube/download")
 async def youtube_download(request: YouTubeRequest):
-    validate_http_url(request.url, block_private_ips=cfg.BLOCK_PRIVATE_IPS)
+    _url, _ = validate_http_url(request.url, block_private_ips=cfg.BLOCK_PRIVATE_IPS)
     task_id = new_task_id()
 
     try:

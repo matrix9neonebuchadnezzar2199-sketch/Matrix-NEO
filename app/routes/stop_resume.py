@@ -9,10 +9,12 @@ from datetime import datetime
 
 from fastapi import APIRouter, HTTPException
 
+from app import config as cfg
 from app import state
 from app.services import youtube_service
 from app.services.download_service import run_download
 from app.task_id import new_task_id
+from app.utils.validation import validate_http_url
 
 router = APIRouter(tags=["tasks"])
 logger = logging.getLogger(__name__)
@@ -36,16 +38,15 @@ async def stop_task(task_id: str):
             logger.exception("stop_task await download")
     state.active_downloads.pop(task_id, None)
 
-    if task.get("output_path") and isinstance(task["output_path"], str) and os.path.exists(
-        task["output_path"]
-    ):
+    partial = os.path.join(cfg.OUTPUT_DIR, task.get("filename", ""))
+    if partial and os.path.isfile(partial):
         try:
-            os.remove(task["output_path"])
+            os.remove(partial)
         except OSError as e:
             logger.debug("stop remove partial: %s", e)
 
     state.tasks[task_id]["status"] = "stopped"
-    state.tasks[task_id]["message"] = "停止しました"
+    state.tasks[task_id]["message"] = "Stopped"
     state.tasks[task_id]["stopped_at"] = datetime.now().isoformat()
 
     logger.info("Task stopped: %s", task_id)
@@ -58,6 +59,7 @@ async def resume_task(task_id: str):
         raise HTTPException(status_code=404, detail="Stopped task not found")
 
     info = state.tasks[task_id]
+    _, resolved_ips = validate_http_url(info["url"], block_private_ips=cfg.BLOCK_PRIVATE_IPS)
     cred = state.task_credentials.get(task_id, {})
     ck, rk = cred.get("cookie"), cred.get("referer")
     new_id = new_task_id()
@@ -68,7 +70,7 @@ async def resume_task(task_id: str):
             "status": "queued",
             "progress": 0,
             "filename": info["filename"],
-            "message": "再開中...",
+            "message": "Resuming...",
             "url": info["url"],
             "type": "youtube",
             "quality": info.get("quality"),
@@ -94,7 +96,7 @@ async def resume_task(task_id: str):
             "status": "queued",
             "progress": 0,
             "filename": info["filename"],
-            "message": "再開中...",
+            "message": "Resuming...",
             "url": info["url"],
             "type": info.get("type", "hls"),
             "thumbnail_url": info.get("thumbnail_url"),
@@ -109,7 +111,7 @@ async def resume_task(task_id: str):
                 info.get("quality"),
                 ck,
                 rk,
-                resolved_ips=None,
+                resolved_ips=resolved_ips,
             )
         )
         state.active_downloads[new_id] = t

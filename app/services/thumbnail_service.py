@@ -9,13 +9,13 @@ import sys
 from datetime import datetime
 from typing import Dict, Optional
 
-import aiofiles
 import asyncio
 import httpx
 
 from app import config as cfg
 from app import state
 from app.services import http_client
+from app.utils.file_ops import replace_or_move_overwrite
 from app.utils.filename import is_ascii_basename
 from app.utils.process import stderr_tail, subprocess_exit_code
 from app.utils.paths import FFMPEG
@@ -90,7 +90,7 @@ async def normalize_thumbnail_to_jpeg_for_embed(src_path: str) -> bool:
         )
         _, err = await proc.communicate()
         if proc.returncode == 0 and os.path.exists(tmp) and os.path.getsize(tmp) > 64:
-            _replace_or_move_overwrite(tmp, src_path)
+            replace_or_move_overwrite(tmp, src_path)
             return True
         if err:
             logger.warning("normalize to JPEG: %s", stderr_tail(err, 400))
@@ -104,17 +104,6 @@ async def normalize_thumbnail_to_jpeg_for_embed(src_path: str) -> bool:
     return False
 
 
-def _replace_or_move_overwrite(src: str, dst: str) -> None:
-    try:
-        os.replace(src, dst)
-    except OSError:
-        shutil.copy2(src, dst)
-        try:
-            os.remove(src)
-        except OSError:
-            pass
-
-
 async def download_thumbnail(
     url: str,
     output_path: str,
@@ -126,8 +115,8 @@ async def download_thumbnail(
         return False
     try:
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-        async with aiofiles.open(output_path, "wb") as f:
-            await f.write(content)
+        with open(output_path, "wb") as f:
+            f.write(content)
         return True
     except Exception as e:
         logger.exception("thumbnail save: %s", e)
@@ -171,7 +160,7 @@ async def embed_thumbnail_ffmpeg(
         )
         out, err = await process.communicate()
         if process.returncode == 0 and os.path.exists(out_path):
-            _replace_or_move_overwrite(out_path, video_path)
+            replace_or_move_overwrite(out_path, video_path)
             return True
         if err or out:
             rc = subprocess_exit_code(process.returncode)
@@ -227,7 +216,7 @@ async def embed_thumbnail_via_ascii_workdir(
     ok = await embed_thumbnail_atomic(work_video, thumb_path, task_id=task_id)
     if ok:
         try:
-            _replace_or_move_overwrite(work_video, video_path)
+            replace_or_move_overwrite(work_video, video_path)
         except OSError as e:
             logger.error("replace result failed: %s", e)
             return False

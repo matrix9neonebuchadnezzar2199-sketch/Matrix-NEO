@@ -11,9 +11,13 @@ def url_with_pinned_ip(original_url: str, resolved_ips: list[str]) -> tuple[str,
     Return (url_for_client, host_header).
     When using a literal IP in the URL, set Host to the original hostname for TLS/SNI.
     """
+    p = urlparse(original_url)
+    # httpx verifies TLS using the request URL host; IP literals break cert verification.
+    # HTTPS では DNS ピン留めを行わず元 URL で接続する。
+    if p.scheme == "https":
+        return original_url, None
     if not resolved_ips:
         return original_url, None
-    p = urlparse(original_url)
     hostname = p.hostname
     if not hostname:
         return original_url, None

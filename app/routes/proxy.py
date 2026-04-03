@@ -25,7 +25,7 @@ async def proxy_image(request: Request, req: ProxyImageRequest):
     if not _limiter.is_allowed(client_host):
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
-    validate_http_url(req.url.strip(), block_private_ips=cfg.BLOCK_PRIVATE_IPS)
+    _url, _ = validate_http_url(req.url.strip(), block_private_ips=cfg.BLOCK_PRIVATE_IPS)
     body, media_type = await fetch_thumbnail_http_bytes(req.url, req.cookie, req.referer)
     if not body:
         raise HTTPException(status_code=502, detail="Upstream image fetch failed")
