@@ -1,0 +1,60 @@
+﻿<!DOCTYPE html>
+<html>
+<head>
+  <title>MATRIX-M Icon Generator</title>
+  <style>
+    body { background: #1a1a1a; color: #00ff00; font-family: monospace; padding: 20px; }
+    canvas { border: 1px solid #00ff00; margin: 10px; }
+    .row { display: flex; align-items: center; gap: 20px; margin: 20px 0; }
+    a { color: #00ff00; }
+  </style>
+</head>
+<body>
+  <h1>MATRIX-M アイコン生成</h1>
+  <p>各キャンバスを右クリック → 「名前を付けて画像を保存」</p>
+  
+  <div class="row">
+    <div>
+      <p>icon16.png</p>
+      <canvas id="icon16" width="16" height="16"></canvas>
+    </div>
+    <div>
+      <p>icon48.png</p>
+      <canvas id="icon48" width="48" height="48"></canvas>
+    </div>
+    <div>
+      <p>icon128.png</p>
+      <canvas id="icon128" width="128" height="128"></canvas>
+    </div>
+  </div>
+
+  <script>
+    function drawIcon(canvasId, size) {
+      const canvas = document.getElementById(canvasId);
+      const ctx = canvas.getContext('2d');
+      
+      // 背景
+      ctx.fillStyle = '#0a0a0a';
+      ctx.fillRect(0, 0, size, size);
+      
+      // 枠線
+      ctx.strokeStyle = '#00ff00';
+      ctx.lineWidth = size > 20 ? 2 : 1;
+      ctx.strokeRect(1, 1, size-2, size-2);
+      
+      // "M" 文字
+      ctx.fillStyle = '#00ff00';
+      ctx.font = `bold ${size * 0.6}px monospace`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.shadowColor = '#00ff00';
+      ctx.shadowBlur = size > 20 ? 4 : 2;
+      ctx.fillText('M', size/2, size/2 + 1);
+    }
+    
+    drawIcon('icon16', 16);
+    drawIcon('icon48', 48);
+    drawIcon('icon128', 128);
+  </script>
+</body>
+</html>

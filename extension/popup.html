@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=400">
+  <title>MATRIX-NEO_v2.0</title>
+  <link rel="stylesheet" href="popup.css">
+  <link href="https://fonts.googleapis.com/css2?family=VT323&display=swap" rel="stylesheet">
+</head>
+<body>
+  <div class="crt-overlay"></div>
+  
+  <div class="container">
+    <!-- ヘッダー -->
+    <header class="header">
+      <div class="title">MATRIX-NEO_v2.0</div>
+      <div class="status" id="serverStatus">
+        <span class="status-dot"></span>
+        <span class="status-text">接続中...</span>
+      </div>
+    </header>
+    
+    <!-- 検出された動画一覧 -->
+    <div class="video-list" id="videoList">
+      <div class="empty-message">
+        <span class="blink">_</span> 動画を検出中...
+      </div>
+    </div>
+    
+    <!-- 設定パネル（トグル） -->
+    <div class="settings-toggle">
+      <button class="btn-icon" id="toggleSettings" title="設定">⚙</button>
+    </div>
+    
+    <div class="settings-panel" id="settingsPanel" style="display:none;">
+      <div class="setting-row">
+        <label>サーバー:</label>
+        <input type="text" id="serverUrl" value="http://localhost:6850" />
+      </div>
+      <div class="setting-row">
+        <button class="btn-small" id="saveSettings">保存</button>
+        <button class="btn-small" id="testConnection">テスト</button>
+      </div>
+    </div>
+  </div>
+  
+  <script src="popup.js"></script>
+</body>
+</html>

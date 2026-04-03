@@ -1,0 +1,8 @@
+.venv/
+build/
+dist/
+output/
+temp/*
+!temp/.gitkeep
+__pycache__/
+*.spec.bak

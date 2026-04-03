@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <link rel="stylesheet" href="sidepanel.css">
+</head>
+<body>
+    <div class="header">
+        <div class="header-left">
+            <span class="logo">MATRIX-NEO_v2.0</span>
+            <span id="serverStatus" class="status offline">Offline</span>
+            <span id="vpnStatus" class="vpn-status checking">VPN: ...</span>
+        </div>
+        <div class="header-right">
+            <button type="button" id="startServerBtn" class="header-server-btn" title="新しいコマンドプロンプトで python run_server.py を実行します。初回は extension\\register-server-protocol.reg を取り込んでください。">サーバー起動</button>
+            <button id="settingsBtn" class="settings-btn">&#9881;</button>
+        </div>
+    </div>
+
+    <div class="tabs">
+        <button class="tab-btn active" data-tab="download">DOWNLOAD</button>
+        <button class="tab-btn" data-tab="history">HISTORY</button>
+        <button class="tab-btn" data-tab="analyze">ANALYZE</button>
+    </div>
+
+    <div id="downloadTab" class="tab-content active">
+        <div id="videoList">
+            <div class="videos-section"></div>
+        </div>
+    </div>
+
+    <div id="historyTab" class="tab-content">
+        <div class="history-header">
+            <span>Download History (<span id="historyCount">0</span>)</span>
+            <button id="clearHistory" class="btn btn-sm btn-danger">Clear All</button>
+        </div>
+        <div id="historyList"></div>
+    </div>
+
+    <div id="analyzeTab" class="tab-content">
+        <div class="analyze-header">
+            <span>Site Structure Analyzer</span>
+        </div>
+        <div class="analyze-controls">
+            <button id="analyzeBtn" class="btn btn-primary">Analyze Current Page</button>
+            <button id="copyAnalysis" class="btn btn-sm">Copy Results</button>
+        </div>
+        <div class="analyze-results">
+            <textarea id="analysisOutput" readonly placeholder="Click 'Analyze Current Page' to scan the current site structure..."></textarea>
+        </div>
+    </div>
+
+    <div id="vpnModal" class="modal">
+        <div class="modal-content vpn-modal">
+            <div class="modal-header">
+                <span>VPN Connection Details</span>
+                <button id="closeVpnModal" class="modal-close">&times;</button>
+            </div>
+            <div class="vpn-details">
+                <div class="vpn-status-large" id="vpnStatusLarge">
+                    <span class="vpn-icon-large">🔄</span>
+                    <span class="vpn-label">Checking...</span>
+                </div>
+                <div class="vpn-info-grid">
+                    <div class="vpn-info-item">
+                        <span class="vpn-info-label">IP Address</span>
+                        <span class="vpn-info-value" id="vpnIp">---</span>
+                    </div>
+                    <div class="vpn-info-item">
+                        <span class="vpn-info-label">Country</span>
+                        <span class="vpn-info-value" id="vpnCountry">---</span>
+                    </div>
+                    <div class="vpn-info-item">
+                        <span class="vpn-info-label">City</span>
+                        <span class="vpn-info-value" id="vpnCity">---</span>
+                    </div>
+                    <div class="vpn-info-item">
+                        <span class="vpn-info-label">ISP / Organization</span>
+                        <span class="vpn-info-value" id="vpnOrg">---</span>
+                    </div>
+                    <div class="vpn-info-item">
+                        <span class="vpn-info-label">Connection Type</span>
+                        <span class="vpn-info-value" id="vpnType">---</span>
+                    </div>
+                </div>
+                <div class="vpn-actions">
+                    <button id="vpnRefresh" class="btn">Refresh</button>
+                </div>
+                <div class="vpn-warning-box" id="vpnWarningBox" style="display:none;">
+                    <span class="warning-icon">⚠️</span>
+                    <span class="warning-text">Your real IP may be exposed! Enable VPN for Docker.</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="settingsModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <span>Settings</span>
+                <button id="closeModal" class="close-btn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="setting-group">
+                    <label>Server URL</label>
+                    <input type="text" id="serverUrl" value="http://localhost:6850">
+                    <div class="setting-actions">
+                        <button id="saveSettings" class="btn">Save</button>
+                        <button id="testConnection" class="btn">Test</button>
+                    </div>
+                </div>
+                <div class="setting-group">
+                    <label>Saved List (<span id="savedListCount">0</span>)</label>
+                    <div class="setting-actions">
+                        <button id="importSavedList" class="btn">Import from folder</button>
+                        <button id="exportSavedList" class="btn">Export</button>
+                        <button id="clearSavedList" class="btn btn-danger">Clear</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="sidepanel.js"></script>
+</body>
+</html>

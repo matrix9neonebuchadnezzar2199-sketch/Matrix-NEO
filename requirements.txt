@@ -1,0 +1,9 @@
+# 古い pin（pydantic 2.5 系）は Python 3.14 で pydantic-core のホイールが無く Rust ビルドになり失敗しやすい。
+# 問題が出る場合は Python 3.12 / 3.13 の venv を推奨。
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+aiohttp>=3.9.0
+aiofiles>=23.2.0
+pydantic>=2.11.0
+python-multipart>=0.0.9
+httpx>=0.27.0

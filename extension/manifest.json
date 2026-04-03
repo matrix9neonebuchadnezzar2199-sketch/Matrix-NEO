@@ -1,0 +1,59 @@
+{
+  "manifest_version": 3,
+  "name": "MATRIX-NEO_v2.0",
+  "version": "2.0.0",
+  "description": "M3U8/MPD/MP4/WebM 動画を検出してダウンロード",
+
+  "permissions": [
+    "activeTab",
+    "storage",
+    "webRequest",
+    "downloads",
+    "sidePanel",
+    "scripting",
+    "cookies",
+    "tabs"
+  ],
+
+  "host_permissions": [
+    "<all_urls>"
+  ],
+
+  "background": {
+    "service_worker": "background.js"
+  },
+
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.dmm.co.jp/*",
+        "*://*.fanza.com/*",
+        "*://*.missav.com/*",
+        "*://*.pornhub.com/*",
+        "*://*.xvideos.com/*",
+        "*://*.xhamster.com/*"
+      ],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle"
+    }
+  ],
+
+  "action": {
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

@@ -1,0 +1,11 @@
+Windows Registry Editor Version 5.00
+
+; MATRIX-NEO: 拡張の「サーバー起動」ボタン用（初回のみダブルクリックで取り込み）
+; プロジェクトを別ドライブ/フォルダに移した場合は、この .reg 内のパスを編集してください。
+
+[HKEY_CURRENT_USER\Software\Classes\matrixneo]
+@="URL:MATRIX NEO Server"
+"URL Protocol"=""
+
+[HKEY_CURRENT_USER\Software\Classes\matrixneo\shell\open\command]
+@="cmd.exe /c start \"MATRIX NEO Server\" cmd.exe /k \"H:\\TOOL\\MATRIX-NEO\\start_server_terminal.bat\""

@@ -1,0 +1,15 @@
+毎回の起動（PowerShell）
+
+cd H:\TOOL\MATRIX-M\MATRIX-NEO
+.\.venv\Scripts\Activate.ps1
+python run_server.py
+venv をまだ作っていない場合は、その前に:
+
+cd H:\TOOL\MATRIX-M\MATRIX-NEO
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+止めるときは、そのウィンドウで Ctrl+C。
+
+起動
+python run_server.py

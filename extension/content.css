@@ -1,0 +1,102 @@
+﻿/* MATRIX-M Quick Add Overlay */
+.matrix-m-overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(10, 22, 40, 0.7);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    transition: opacity 0.2s ease;
+    pointer-events: none;
+    z-index: 9999;
+}
+
+.matrix-m-container {
+    position: relative;
+}
+
+.matrix-m-container:hover .matrix-m-overlay {
+    opacity: 1;
+    pointer-events: auto;
+}
+
+.matrix-m-add-btn {
+    width: 50px;
+    height: 50px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, #00d4ff 0%, #0080ff 100%);
+    border: 2px solid #00d4ff;
+    color: #fff;
+    font-size: 28px;
+    font-weight: bold;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.3s ease;
+    box-shadow: 0 0 20px rgba(0, 212, 255, 0.5);
+}
+
+.matrix-m-add-btn:hover {
+    transform: scale(1.15);
+    box-shadow: 0 0 30px rgba(0, 212, 255, 0.8);
+}
+
+.matrix-m-add-btn.added {
+    background: linear-gradient(135deg, #00ff88 0%, #00d4ff 100%);
+    border-color: #00ff88;
+    box-shadow: 0 0 20px rgba(0, 255, 136, 0.5);
+}
+
+.matrix-m-add-btn.added::after {
+    content: "✓";
+    font-size: 24px;
+}
+
+.matrix-m-add-btn:not(.added)::after {
+    content: "+";
+}
+
+/* Title tooltip */
+.matrix-m-title {
+    position: absolute;
+    bottom: 5px;
+    left: 5px;
+    right: 5px;
+    background: rgba(0, 0, 0, 0.8);
+    color: #00d4ff;
+    font-size: 11px;
+    padding: 4px 8px;
+    border-radius: 4px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-family: 'Segoe UI', sans-serif;
+}
+
+/* Queue badge */
+.matrix-m-queue-badge {
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    background: linear-gradient(135deg, #00d4ff 0%, #0080ff 100%);
+    color: #fff;
+    padding: 12px 20px;
+    border-radius: 8px;
+    font-family: 'Segoe UI', sans-serif;
+    font-size: 14px;
+    font-weight: bold;
+    box-shadow: 0 0 30px rgba(0, 212, 255, 0.5);
+    z-index: 99999;
+    cursor: pointer;
+    transition: all 0.3s ease;
+}
+
+.matrix-m-queue-badge:hover {
+    transform: scale(1.05);
+    box-shadow: 0 0 40px rgba(0, 212, 255, 0.8);
+}
