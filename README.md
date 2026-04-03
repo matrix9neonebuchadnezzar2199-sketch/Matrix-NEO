@@ -1,13 +1,14 @@
 # MATRIX-NEO（PyInstaller 配布用）
 
 このフォルダは親プロジェクト MATRIX-M とは独立して運用します。  
-MATRIX-M の `app/main.py` をコピーし、exe 同梱向けにパス解決を追加した `main.py` を含みます。
+サーバー実装は `app/` パッケージに分割され、ルートの `main.py` は `from app.main import app` 互換用の薄いラッパーです。
 
 ## フォルダ構成（想定）
 
 | パス | 説明 |
 |------|------|
-| `main.py` | FastAPI アプリ本体 |
+| `app/` | FastAPI アプリ（`routes/`・`services/`・`config.py` など） |
+| `main.py` | 後方互換: `app.main.app` の再エクスポート |
 | `run_server.py` | uvicorn 起動（PyInstaller のエントリ） |
 | `matrix-neo.spec` | PyInstaller 定義 |
 | `build-windows.bat` | Windows で exe ビルド |
@@ -38,11 +39,12 @@ pip install -r requirements.txt
 python run_server.py
 ```
 
-→ <http://127.0.0.1:6850/health>
+→ <http://127.0.0.1:6850/health>（ポートは環境変数 `MATRIX_NEO_PORT` で変更可、既定 **6850**）
 
-## exe のビルド（Windows）
+## exe のビルド（Windows・任意）
 
-`build-windows.bat` を実行すると、`dist\MATRIX-NEO-Server\MATRIX-NEO-Server.exe` が生成されます。
+普段の開発は上記の `python run_server.py` のみで足ります。  
+配布用に単一 exe が必要なときだけ `build-windows.bat` を実行し、`dist\MATRIX-NEO-Server\MATRIX-NEO-Server.exe` を生成します。
 
 ## 配布用 ZIP の作り方
 
@@ -59,7 +61,17 @@ python run_server.py
 
 - 初回のみ Windows ファイアウォールの許可ダイアログが出ることがあります。
 - PyInstaller の exe はウイルス対策ソフトに誤検知される場合があります。
-- ポートは **6850**（`main.py` / `run_server.py` と揃えています）。
+- ポートは **6850**（`run_server.py` と `app.config.PORT`）。拡張のサーバー URL も同じポートに合わせてください。
+
+### 主な環境変数
+
+| 変数 | 既定 | 説明 |
+|------|------|------|
+| `MATRIX_NEO_PORT` | `6850` | 待受ポート |
+| `MATRIX_NEO_LOG_LEVEL` | `INFO` | ログレベル |
+| `MATRIX_NEO_BLOCK_PRIVATE_IPS` | `0` | `1` でプライベート IP 向け URL を拒否（SSRF 緩和・LAN 再生は阻害） |
+| `MATRIX_NEO_TASK_TTL_HOURS` | `24` | 完了/エラータスクをメモリから削除するまでの時間 |
+| `MAX_CONCURRENT_DOWNLOADS` | `10` | 同時ダウンロード数 |
 
 ## トラブル（429 / 中盤で 0.00Bps → Force Exit）
 

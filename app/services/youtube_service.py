@@ -1,0 +1,150 @@
+"""YouTube download via yt-dlp."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import re
+from datetime import datetime
+from typing import Optional
+
+from app import config as cfg
+from app import state
+from app.utils.paths import YTDLP
+
+logger = logging.getLogger(__name__)
+
+_RE_YT_PROGRESS = re.compile(r"\[download\]\s+(\d+\.?\d*)%")
+_RE_YT_SPEED = re.compile(r"at\s+(\d+\.?\d*\s*[KMG]?i?B/s)")
+_RE_YT_SIZE = re.compile(r"of\s+~?(\d+\.?\d*\s*[KMG]?i?B)")
+
+
+async def run_youtube_download(
+    task_id: str,
+    url: str,
+    filename: str,
+    format_type: str,
+    quality: str,
+    thumbnail_url: Optional[str] = None,
+) -> None:
+    async with state.semaphore:
+        try:
+            state.tasks[task_id]["status"] = "downloading"
+            state.tasks[task_id]["message"] = "Starting YouTube download..."
+
+            output_path = os.path.join(cfg.OUTPUT_DIR, filename)
+
+            if format_type == "mp3":
+                format_spec = f"bestaudio[abr<={quality}]/bestaudio/best"
+                cmd = [
+                    YTDLP,
+                    "-f",
+                    format_spec,
+                    "-x",
+                    "--audio-format",
+                    "mp3",
+                    "--audio-quality",
+                    "0",
+                    "--embed-thumbnail",
+                    "--add-metadata",
+                    "-o",
+                    output_path.replace(".mp3", ".%(ext)s"),
+                    "--no-playlist",
+                    "--progress",
+                    "--",
+                    url,
+                ]
+            else:
+                format_spec = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best"
+                cmd = [
+                    YTDLP,
+                    "-f",
+                    format_spec,
+                    "--merge-output-format",
+                    "mp4",
+                    "--embed-thumbnail",
+                    "--add-metadata",
+                    "-o",
+                    output_path,
+                    "--no-playlist",
+                    "--progress",
+                    "--",
+                    url,
+                ]
+
+            logger.info("YT starting: %s (%s, %s)", filename, format_type, quality)
+            start_time = datetime.now()
+
+            process = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+            )
+
+            buffer = ""
+            while True:
+                chunk = await process.stdout.read(4096)
+                if not chunk:
+                    break
+                buffer += chunk.decode("utf-8", errors="ignore")
+                lines = buffer.split("\n")
+                buffer = lines[-1]
+                for text in lines[:-1]:
+                    text = text.strip()
+                    if not text:
+                        continue
+                    m = _RE_YT_PROGRESS.search(text)
+                    if m:
+                        progress = float(m.group(1))
+                        state.tasks[task_id]["progress"] = min(progress * 0.9, 90)
+                    sm = _RE_YT_SPEED.search(text)
+                    zm = _RE_YT_SIZE.search(text)
+                    if m:
+                        msg = f"{state.tasks[task_id]['progress']:.0f}%"
+                        if zm:
+                            msg += f" of {zm.group(1)}"
+                        if sm:
+                            msg += f" ({sm.group(1)})"
+                        state.tasks[task_id]["message"] = msg
+                    if "Merging" in text or "muxing" in text.lower():
+                        state.tasks[task_id]["progress"] = 90
+                        state.tasks[task_id]["message"] = "Merging..."
+                    if "[ExtractAudio]" in text:
+                        state.tasks[task_id]["progress"] = 85
+                        state.tasks[task_id]["message"] = "Extracting audio..."
+
+            await process.wait()
+            download_time = (datetime.now() - start_time).total_seconds()
+
+            actual_output = output_path
+            if not os.path.exists(output_path):
+                base = os.path.splitext(output_path)[0]
+                for ext in [".mp4", ".mp3", ".webm", ".mkv", ".m4a"]:
+                    if os.path.exists(base + ext):
+                        actual_output = base + ext
+                        break
+
+            if os.path.exists(actual_output):
+                file_size = os.path.getsize(actual_output)
+                size_mb = file_size / (1024 * 1024)
+                speed_mbps = size_mb / download_time if download_time > 0 else 0
+                state.tasks[task_id]["file_size"] = file_size
+                state.tasks[task_id]["status"] = "completed"
+                state.tasks[task_id]["progress"] = 100
+                state.tasks[task_id]["message"] = f"Done! {size_mb:.1f}MB ({speed_mbps:.1f}MB/s)"
+                state.tasks[task_id]["completed_at"] = datetime.now().isoformat()
+                logger.info("YT completed: %s (%.1fMB in %.1fs)", filename, size_mb, download_time)
+            else:
+                state.tasks[task_id]["status"] = "error"
+                state.tasks[task_id]["message"] = "Download failed"
+                logger.error("YT failed: %s", filename)
+
+        except asyncio.CancelledError:
+            state.tasks[task_id]["status"] = "error"
+            state.tasks[task_id]["message"] = "Cancelled"
+        except Exception as e:
+            state.tasks[task_id]["status"] = "error"
+            state.tasks[task_id]["message"] = str(e)[:50]
+            logger.exception("YT error: %s", e)
+        finally:
+            state.active_downloads.pop(task_id, None)

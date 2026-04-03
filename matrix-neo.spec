@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 # PyInstaller spec for MATRIX-NEO (run from MATRIX-NEO folder)
 
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 block_cipher = None
 
@@ -26,9 +26,11 @@ a = Analysis(
         'uvicorn.protocols.websockets.auto',
         'uvicorn.lifespan',
         'uvicorn.lifespan.on',
+        'main',
             ]
             + hiddenimports_uv
             + hiddenimports_fa
+            + collect_submodules('app')
         )
     ),
     hookspath=[],

@@ -3,7 +3,7 @@
 /** Windows: register-server-protocol.reg 登録後、cmd /k で run_server を起動 */
 const MATRIX_NEO_SERVER_LAUNCH_URL = 'matrixneo://run-server/';
 
-let serverUrl = 'http://localhost:58500';
+let serverUrl = 'http://localhost:6850';
 let detectedVideos = new Map();
 let downloadTasks = new Map();
 let selectedQualities = new Map();
