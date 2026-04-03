@@ -10,6 +10,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.12", "3.13"]
     steps:
@@ -20,4 +21,4 @@ jobs:
       - name: Install
         run: pip install -r requirements-dev.txt
       - name: Pytest
-        run: pytest -q
+        run: pytest -v --tb=short

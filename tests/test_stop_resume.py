@@ -20,9 +20,6 @@ def test_resume_hls_revalidates_url_and_passes_resolved_ips(monkeypatch):
     monkeypatch.setattr("app.routes.stop_resume.validate_http_url", fake_validate)
 
     tid = "t_resume_hls"
-    st.tasks.clear()
-    st.active_downloads.clear()
-    st.task_credentials.clear()
     st.tasks[tid] = {
         "task_id": tid,
         "status": "stopped",
@@ -31,7 +28,7 @@ def test_resume_hls_revalidates_url_and_passes_resolved_ips(monkeypatch):
         "type": "hls",
     }
 
-    client = TestClient(app)
-    r = client.post(f"/task/{tid}/resume")
+    with TestClient(app, raise_server_exceptions=False) as client:
+        r = client.post(f"/task/{tid}/resume")
     assert r.status_code == 200
     assert captured.get("kwargs", {}).get("resolved_ips") == ["192.0.2.1"]
