@@ -12,6 +12,7 @@ import multiprocessing
 def main() -> None:
     import uvicorn
 
+    # Version: app.__version__ in app/__init__.py (PyInstaller entry stays run_server.py)
     from app.config import PORT
     from app.main import app
 

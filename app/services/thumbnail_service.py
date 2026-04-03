@@ -327,6 +327,15 @@ async def thumbnail_worker() -> None:
 
         except Exception:
             logger.exception("thumbnail_worker")
+            if job and job.get("task_id") in state.tasks:
+                tid = job["task_id"]
+                if state.tasks[tid].get("status") == "thumbnail":
+                    state.tasks[tid]["status"] = "completed"
+                    state.tasks[tid]["progress"] = 100
+                    state.tasks[tid]["message"] = (
+                        state.tasks[tid].get("message", "Done!") + " [thumb error]"
+                    )
+                    state.tasks[tid]["completed_at"] = datetime.now().isoformat()
         finally:
             if state.thumb_queue is not None and job is not None:
                 state.thumb_queue.task_done()

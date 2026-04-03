@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
 from datetime import datetime
@@ -15,7 +14,6 @@ from app import state
 from app.models import YouTubeRequest
 from app.services import youtube_service
 from app.task_id import new_task_id
-from app.utils.paths import YTDLP
 from app.utils.validation import validate_http_url
 
 router = APIRouter(tags=["youtube"])
@@ -26,19 +24,7 @@ logger = logging.getLogger(__name__)
 async def youtube_info(url: str):
     validate_http_url(url, block_private_ips=cfg.BLOCK_PRIVATE_IPS)
     try:
-        cmd = [YTDLP, "--dump-json", "--no-playlist", "--", url]
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await process.communicate()
-
-        if process.returncode != 0:
-            logger.error("YT info: %s", stderr.decode("utf-8", errors="ignore")[:500])
-            raise HTTPException(status_code=400, detail="Failed to get video info")
-
-        info = json.loads(stdout.decode("utf-8"))
+        info = await youtube_service.fetch_youtube_json(url)
         video_qualities = set()
         audio_qualities = set()
         for fmt in info.get("formats", []):
@@ -69,16 +55,11 @@ async def youtube_download(request: YouTubeRequest):
     task_id = new_task_id()
 
     try:
-        cmd = [YTDLP, "--dump-json", "--no-playlist", "--", request.url]
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await process.communicate()
-        info = json.loads(stdout.decode("utf-8"))
+        info = await youtube_service.fetch_youtube_json(request.url)
         title = info.get("title", "video")
         thumbnail_url = info.get("thumbnail", "")
+    except HTTPException:
+        raise
     except Exception:
         title = "video"
         thumbnail_url = ""

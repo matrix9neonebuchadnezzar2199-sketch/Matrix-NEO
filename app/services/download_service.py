@@ -7,11 +7,11 @@ import logging
 import os
 import re
 import time
+from collections import deque
 from datetime import datetime
 from typing import Optional
 from urllib.parse import urlparse
 
-import aiofiles
 import httpx
 
 from app import config as cfg
@@ -20,6 +20,7 @@ from app.services import http_client
 from app.utils.filename import sanitize_filename_for_windows
 from app.utils.paths import FFMPEG, N_M3U8DL_RE
 from app.utils.process import stderr_tail, subprocess_exit_code
+from app.utils.url_connection import url_with_pinned_ip
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +138,8 @@ async def download_http_progressive_file(
     dest_path: str,
     cookie: Optional[str],
     referer: Optional[str],
+    *,
+    resolved_ips: Optional[list[str]] = None,
 ) -> bool:
     ua = cfg.DEFAULT_UA
     headers = {
@@ -149,6 +152,13 @@ async def download_http_progressive_file(
     if referer and referer.strip():
         headers["Referer"] = referer.strip()
 
+    req_url = url
+    if resolved_ips:
+        pinned, host_header = url_with_pinned_ip(url, resolved_ips)
+        req_url = pinned
+        if host_header:
+            headers["Host"] = host_header
+
     tmp = dest_path + ".part"
     try:
         if os.path.isfile(tmp):
@@ -156,20 +166,21 @@ async def download_http_progressive_file(
     except OSError:
         pass
 
-    timeout = httpx.Timeout(3600.0, connect=60.0)
+    # Connect 30s, read idle 5min (chunk stalled); N_m3u8DL/yt-dlp は別経路
+    timeout = httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=30.0)
     client = http_client.get_client()
     try:
-        async with client.stream("GET", url, headers=headers, timeout=timeout) as response:
+        async with client.stream("GET", req_url, headers=headers, timeout=timeout) as response:
             if response.status_code < 200 or response.status_code >= 400:
                 logger.warning("direct HTTP status=%s", response.status_code)
                 return False
             total = int(response.headers.get("content-length") or 0)
             downloaded = 0
-            async with aiofiles.open(tmp, "wb") as f:
+            with open(tmp, "wb") as f:
                 async for chunk in response.aiter_bytes(chunk_size=256 * 1024):
                     if not chunk:
                         continue
-                    await f.write(chunk)
+                    f.write(chunk)
                     downloaded += len(chunk)
                     if total > 0:
                         state.tasks[task_id]["progress"] = min(88, int(downloaded * 88 / total))
@@ -262,8 +273,10 @@ async def run_download(
     request_quality: Optional[str] = None,
     cookie: Optional[str] = None,
     referer: Optional[str] = None,
+    resolved_ips: Optional[list[str]] = None,
 ) -> None:
     async with state.semaphore:
+        process: Optional[asyncio.subprocess.Process] = None
         try:
             filename = sanitize_filename_for_windows(filename)
             if task_id in state.tasks:
@@ -279,7 +292,12 @@ async def run_download(
                 state.tasks[task_id]["message"] = "Downloading (HTTP)..."
                 wall_start = datetime.now()
                 ok = await download_http_progressive_file(
-                    task_id, url, output_path, cookie, referer
+                    task_id,
+                    url,
+                    output_path,
+                    cookie,
+                    referer,
+                    resolved_ips=resolved_ips,
                 )
                 download_time = (datetime.now() - wall_start).total_seconds()
                 if (
@@ -327,6 +345,8 @@ async def run_download(
                     logger.info("Completed: %s [no thumb]", filename)
                 return
 
+            # N_m3u8DL-RE は子プロセス内で独自に DNS 解決するため、ここでの検証後に IP が
+            # 切り替わる（DNS rebinding）リスクは完全には排除できない。
             save_name_dl = "mneo_" + re.sub(r"[^0-9A-Za-z_]+", "_", task_id).strip("_")
 
             _mux_ts = os.environ.get("MATRIX_NEO_M3U8_MUX_TS", "1").strip().lower() not in (
@@ -409,10 +429,12 @@ async def run_download(
 
                 is_merging = False
                 killed_stall = False
+                last_lines: deque[str] = deque(maxlen=5)
                 async for line in process.stdout:
                     text = line.decode("utf-8", errors="ignore").strip()
                     if not text:
                         continue
+                    last_lines.append(text)
                     logger.debug("N_m3u8DL %s", text)
 
                     if stall_monitor.feed(text):
@@ -448,6 +470,17 @@ async def run_download(
 
                 await process.wait()
                 logger.info("N_m3u8DL exit code: %s", process.returncode)
+                if process.returncode != 0 and not killed_stall:
+                    tail = " | ".join(last_lines)
+                    logger.warning(
+                        "N_m3u8DL non-zero exit=%s for %s tail=%s",
+                        process.returncode,
+                        filename,
+                        tail[:400],
+                    )
+                    state.tasks[task_id][
+                        "message"
+                    ] = f"N_m3u8DL exit {process.returncode}"
 
                 if (
                     killed_stall
@@ -600,8 +633,11 @@ async def run_download(
                 )
 
         except asyncio.CancelledError:
+            if process is not None:
+                await terminate_child_process(process)
             state.tasks[task_id]["status"] = "error"
             state.tasks[task_id]["message"] = "Cancelled"
+            raise
         except Exception as e:
             state.tasks[task_id]["status"] = "error"
             state.tasks[task_id]["message"] = str(e)[:50]

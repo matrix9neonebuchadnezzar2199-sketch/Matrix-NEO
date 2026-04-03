@@ -49,30 +49,7 @@ async def vpn_status():
                 country_code = data.get("country_code") or data.get("countryCode") or ""
                 city = data.get("city") or ""
                 org = data.get("org") or data.get("isp") or ""
-                vpn_keywords = [
-                    "vpn",
-                    "nord",
-                    "express",
-                    "surfshark",
-                    "private",
-                    "proxy",
-                    "hosting",
-                    "server",
-                    "data center",
-                    "datacenter",
-                    "packethub",
-                    "m247",
-                    "datacamp",
-                    "ovh",
-                    "leaseweb",
-                    "zscaler",
-                    "cloudflare warp",
-                    "mullvad",
-                    "cyberghost",
-                    "pia",
-                    "proton",
-                ]
-                is_likely_vpn = any(kw in org.lower() for kw in vpn_keywords)
+                is_likely_vpn = any(kw in org.lower() for kw in cfg.VPN_KEYWORDS)
                 is_japan = country_code.upper() == "JP"
                 return {
                     "success": True,

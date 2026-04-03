@@ -13,6 +13,7 @@ from app import state
 from app.models import DownloadRequest
 from app.services import download_service
 from app.task_id import new_task_id
+from app.utils.filename import sanitize_filename_for_windows
 from app.utils.validation import validate_http_url
 
 router = APIRouter(tags=["download"])
@@ -21,20 +22,25 @@ logger = logging.getLogger(__name__)
 
 @router.post("/download")
 async def download(request: DownloadRequest):
-    validate_http_url(request.url, block_private_ips=cfg.BLOCK_PRIVATE_IPS)
+    validated_url, resolved_ips = validate_http_url(
+        request.url, block_private_ips=cfg.BLOCK_PRIVATE_IPS
+    )
 
     task_id = new_task_id()
     filename = request.filename or f"video_{task_id}.mp4"
     if not filename.endswith(".mp4"):
         filename += ".mp4"
-    from app.utils.filename import sanitize_filename_for_windows
-
     filename = sanitize_filename_for_windows(filename)
 
     if request.thumbnail_url:
         logger.info("Thumbnail URL received for: %s...", filename[:50])
     else:
         logger.info("NO thumbnail URL for: %s...", filename[:50])
+
+    state.task_credentials[task_id] = {
+        "cookie": request.cookie,
+        "referer": request.referer,
+    }
 
     state.tasks[task_id] = {
         "task_id": task_id,
@@ -43,8 +49,6 @@ async def download(request: DownloadRequest):
         "thumbnail_url": request.thumbnail_url,
         "quality": request.quality,
         "type": "hls",
-        "cookie": request.cookie,
-        "referer": request.referer,
         "status": "queued",
         "progress": 0,
         "message": "Queue...",
@@ -54,12 +58,13 @@ async def download(request: DownloadRequest):
     task = asyncio.create_task(
         download_service.run_download(
             task_id,
-            request.url,
+            validated_url,
             filename,
             request.thumbnail_url,
             request.quality,
             request.cookie,
             request.referer,
+            resolved_ips=resolved_ips,
         )
     )
     state.active_downloads[task_id] = task

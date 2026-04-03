@@ -22,9 +22,12 @@ async def task_gc_worker() -> None:
             expired: list[str] = []
             for tid, t in list(state.tasks.items()):
                 st = t.get("status")
-                if st not in ("completed", "error"):
+                if st in ("completed", "error"):
+                    ca = t.get("completed_at")
+                elif st == "stopped":
+                    ca = t.get("stopped_at")
+                else:
                     continue
-                ca = t.get("completed_at")
                 if not ca:
                     continue
                 try:
@@ -35,6 +38,7 @@ async def task_gc_worker() -> None:
                     expired.append(tid)
             for tid in expired:
                 state.tasks.pop(tid, None)
+                state.task_credentials.pop(tid, None)
                 logger.debug("task GC removed %s", tid)
             if expired:
                 logger.info("task GC removed %s completed/error task(s)", len(expired))

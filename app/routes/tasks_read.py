@@ -32,6 +32,7 @@ async def delete_task(task_id: str):
         del state.active_downloads[task_id]
     if task_id in state.tasks:
         del state.tasks[task_id]
+        state.task_credentials.pop(task_id, None)
         return {"status": "deleted"}
     raise HTTPException(status_code=404, detail="Task not found")
 

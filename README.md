@@ -69,8 +69,11 @@ python run_server.py
 |------|------|------|
 | `MATRIX_NEO_PORT` | `6850` | 待受ポート |
 | `MATRIX_NEO_LOG_LEVEL` | `INFO` | ログレベル |
-| `MATRIX_NEO_BLOCK_PRIVATE_IPS` | `0` | `1` でプライベート IP 向け URL を拒否（SSRF 緩和・LAN 再生は阻害） |
-| `MATRIX_NEO_TASK_TTL_HOURS` | `24` | 完了/エラータスクをメモリから削除するまでの時間 |
+| `MATRIX_NEO_BLOCK_PRIVATE_IPS` | `0` | `1` でプライベート IP 向け URL を拒否（SSRF 緩和・LAN 再生は阻害）。**リンクローカル / ULA / 169.254.0.0/16（メタデータ等）はフラグに関係なく常に拒否** |
+| `MATRIX_NEO_TASK_TTL_HOURS` | `24` | 完了/エラー/**停止**タスクをメモリから削除するまでの時間 |
+| `MATRIX_NEO_PROXY_IMAGE_RATE_LIMIT` | `30` | `/proxy-image` のクライアントあたり許可リクエスト数（ウィンドウ内） |
+| `MATRIX_NEO_PROXY_IMAGE_RATE_WINDOW_SEC` | `60` | 上記のウィンドウ秒 |
+| `MATRIX_NEO_VPN_KEYWORDS` | （既定リスト） | `/vpn-status` の ISP 名判定用キーワード（カンマ区切り） |
 | `MAX_CONCURRENT_DOWNLOADS` | `10` | 同時ダウンロード数 |
 
 変数の一覧例はリポジトリ直下の **`.env.example`** を参照してください。機密やローカル上書き用の **`.env`** は Git に含めません。

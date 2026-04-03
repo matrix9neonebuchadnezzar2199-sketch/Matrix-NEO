@@ -58,6 +58,8 @@ async def resume_task(task_id: str):
         raise HTTPException(status_code=404, detail="Stopped task not found")
 
     info = state.tasks[task_id]
+    cred = state.task_credentials.get(task_id, {})
+    ck, rk = cred.get("cookie"), cred.get("referer")
     new_id = new_task_id()
 
     if info.get("type") == "youtube":
@@ -86,6 +88,7 @@ async def resume_task(task_id: str):
         )
         state.active_downloads[new_id] = t
     else:
+        state.task_credentials[new_id] = {"cookie": ck, "referer": rk}
         state.tasks[new_id] = {
             "task_id": new_id,
             "status": "queued",
@@ -95,8 +98,6 @@ async def resume_task(task_id: str):
             "url": info["url"],
             "type": info.get("type", "hls"),
             "thumbnail_url": info.get("thumbnail_url"),
-            "cookie": info.get("cookie"),
-            "referer": info.get("referer"),
             "created_at": datetime.now().isoformat(),
         }
         t = asyncio.create_task(
@@ -106,12 +107,14 @@ async def resume_task(task_id: str):
                 info["filename"],
                 info.get("thumbnail_url"),
                 info.get("quality"),
-                info.get("cookie"),
-                info.get("referer"),
+                ck,
+                rk,
+                resolved_ips=None,
             )
         )
         state.active_downloads[new_id] = t
 
+    state.task_credentials.pop(task_id, None)
     state.tasks.pop(task_id, None)
 
     logger.info("Task resumed: %s -> %s", task_id, new_id)
@@ -138,5 +141,6 @@ async def clear_stopped_tasks():
         if state.tasks[task_id].get("status") in ("stopped", "error", "completed"):
             cleared.append(task_id)
             del state.tasks[task_id]
+            state.task_credentials.pop(task_id, None)
     logger.info("clear-stopped: %s tasks", len(cleared))
     return {"status": "ok", "cleared_count": len(cleared)}

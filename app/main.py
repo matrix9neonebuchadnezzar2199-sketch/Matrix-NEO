@@ -29,8 +29,9 @@ async def lifespan(app: FastAPI):
     os.makedirs(cfg.OUTPUT_DIR, exist_ok=True)
     os.makedirs(cfg.TEMP_DIR, exist_ok=True)
     state.thumb_queue = asyncio.Queue()
-    asyncio.create_task(thumbnail_worker())
-    asyncio.create_task(task_gc.task_gc_worker())
+    bg_tasks: list[asyncio.Task] = []
+    bg_tasks.append(asyncio.create_task(thumbnail_worker()))
+    bg_tasks.append(asyncio.create_task(task_gc.task_gc_worker()))
 
     _mux_ts_on = os.environ.get("MATRIX_NEO_M3U8_MUX_TS", "1").strip().lower() not in (
         "0",
@@ -63,6 +64,9 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    for t in bg_tasks:
+        t.cancel()
+    await asyncio.gather(*bg_tasks, return_exceptions=True)
     await http_client.stop_client()
     logger.info("MATRIX-NEO shutdown complete")
 

@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
-# PyInstaller spec for MATRIX-NEO (run from MATRIX-NEO folder)
+# PyInstaller spec for MATRIX-NEO (run from MATRIX-NEO folder).
+# App version: app/__init__.py __version__ (collect_submodules('app') pulls app package).
 
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 

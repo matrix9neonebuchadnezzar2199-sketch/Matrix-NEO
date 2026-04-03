@@ -7,14 +7,47 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import datetime
 from typing import Optional
 
+from fastapi import HTTPException
+
 from app import config as cfg
 from app import state
+from app.services.download_service import terminate_child_process
 from app.utils.paths import YTDLP
 
 logger = logging.getLogger(__name__)
+
+_YT_JSON_CACHE: dict[str, tuple[dict, float]] = {}
+_YT_META_TTL = 300.0
+
+
+async def fetch_youtube_json(url: str) -> dict:
+    """Single --dump-json fetch with TTL cache (shared by /youtube/info and /youtube/download)."""
+    now = time.time()
+    if url in _YT_JSON_CACHE:
+        data, ts = _YT_JSON_CACHE[url]
+        if now - ts < _YT_META_TTL:
+            return data
+    cmd = [YTDLP, "--dump-json", "--no-playlist", "--", url]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60.0)
+    except asyncio.TimeoutError:
+        await terminate_child_process(proc)
+        raise HTTPException(status_code=408, detail="yt-dlp timed out") from None
+    if proc.returncode != 0:
+        logger.error("YT dump-json: %s", (stderr or b"").decode("utf-8", errors="ignore")[:500])
+        raise HTTPException(status_code=400, detail="Failed to get video info")
+    data = json.loads(stdout.decode("utf-8"))
+    _YT_JSON_CACHE[url] = (data, now)
+    return data
 
 _RE_YT_PROGRESS = re.compile(r"\[download\]\s+(\d+\.?\d*)%")
 _RE_YT_SPEED = re.compile(r"at\s+(\d+\.?\d*\s*[KMG]?i?B/s)")
@@ -30,6 +63,7 @@ async def run_youtube_download(
     thumbnail_url: Optional[str] = None,
 ) -> None:
     async with state.semaphore:
+        process: Optional[asyncio.subprocess.Process] = None
         try:
             state.tasks[task_id]["status"] = "downloading"
             state.tasks[task_id]["message"] = "Starting YouTube download..."
@@ -157,8 +191,11 @@ async def run_youtube_download(
                 logger.error("YT failed: %s", filename)
 
         except asyncio.CancelledError:
+            if process is not None:
+                await terminate_child_process(process)
             state.tasks[task_id]["status"] = "error"
             state.tasks[task_id]["message"] = "Cancelled"
+            raise
         except Exception as e:
             state.tasks[task_id]["status"] = "error"
             state.tasks[task_id]["message"] = str(e)[:50]

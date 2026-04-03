@@ -6,6 +6,11 @@ import os
 import sys
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+# Load .env before reading os.environ (see .env.example)
+load_dotenv()
+
 
 def _base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -51,3 +56,19 @@ DEFAULT_UA = os.environ.get(
     "MATRIX_NEO_M3U8_USER_AGENT",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
 )
+
+# /proxy-image: sliding window per client
+PROXY_IMAGE_RATE_LIMIT = int(os.environ.get("MATRIX_NEO_PROXY_IMAGE_RATE_LIMIT", "30"))
+PROXY_IMAGE_RATE_WINDOW_SEC = float(
+    os.environ.get("MATRIX_NEO_PROXY_IMAGE_RATE_WINDOW_SEC", "60")
+)
+
+_default_vpn_kw = (
+    "vpn,nord,express,surfshark,private,proxy,hosting,server,data center,datacenter,"
+    "packethub,m247,datacamp,ovh,leaseweb,zscaler,cloudflare warp,mullvad,cyberghost,pia,proton"
+)
+VPN_KEYWORDS = [
+    kw.strip().lower()
+    for kw in os.environ.get("MATRIX_NEO_VPN_KEYWORDS", _default_vpn_kw).split(",")
+    if kw.strip()
+]
