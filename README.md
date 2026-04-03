@@ -73,6 +73,8 @@ python run_server.py
 | `MATRIX_NEO_TASK_TTL_HOURS` | `24` | 完了/エラータスクをメモリから削除するまでの時間 |
 | `MAX_CONCURRENT_DOWNLOADS` | `10` | 同時ダウンロード数 |
 
+変数の一覧例はリポジトリ直下の **`.env.example`** を参照してください。機密やローカル上書き用の **`.env`** は Git に含めません。
+
 ## トラブル（429 / 中盤で 0.00Bps → Force Exit）
 
 配信側のレート制限やセグメント URL の期限で、止まって N_m3u8DL が諦めることがあります。

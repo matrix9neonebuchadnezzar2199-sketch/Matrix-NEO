@@ -6,3 +6,7 @@ temp/*
 !temp/.gitkeep
 __pycache__/
 *.spec.bak
+
+.env
+.DS_Store
+__MACOSX/

@@ -337,6 +337,9 @@ async def run_download(
             )
 
             def _build_m3u8_cmd(use_mt: bool) -> list:
+                # N_m3u8DL-RE は `N_m3u8DL-RE <input> [options]` で URL が先頭必須のため、
+                # POSIX 風の「末尾 `--` + URL」は使えない。create_subprocess_exec なのでシェル
+                # インジェクションは発生しにくい（先頭が `-` の URL は実質稀）。
                 c = [
                     N_M3U8DL_RE,
                     url,
@@ -476,6 +479,23 @@ async def run_download(
             file_size = os.path.getsize(raw_output) if file_exists else 0
 
             if file_exists and file_size > 1024 * 1024:
+                # save_name（ASCII）とユーザー指定 filename が異なると .mp4 が mneo_* に残り、
+                # 正規化が空の output_path を参照する。先に希望パスへ寄せる。
+                if raw_output.endswith(".mp4") and os.path.normcase(
+                    os.path.normpath(raw_output)
+                ) != os.path.normcase(os.path.normpath(output_path)):
+                    try:
+                        _replace_or_move_overwrite(raw_output, output_path)
+                        logger.info(
+                            "Renamed %s → %s",
+                            os.path.basename(raw_output),
+                            os.path.basename(output_path),
+                        )
+                        raw_output = output_path
+                        file_size = os.path.getsize(output_path)
+                    except OSError as e:
+                        logger.error("Rename to output_path failed: %s", e)
+
                 size_mb = file_size / (1024 * 1024)
                 speed_mbps = size_mb / download_time if download_time > 0 else 0
 

@@ -81,37 +81,54 @@ async def run_youtube_download(
                 *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
             )
 
-            buffer = ""
+            # yt-dlp はプログレス表示に \r（行上書き）を使うことがあるため、\n だけの split では
+            # 進捗が取れない。bytearray で \r / \n の両方をデリミタにし、O(n²) の文字列連結を避ける。
+            def _apply_yt_line(raw: str) -> None:
+                text = raw.strip()
+                if not text:
+                    return
+                m = _RE_YT_PROGRESS.search(text)
+                if m:
+                    progress = float(m.group(1))
+                    state.tasks[task_id]["progress"] = min(progress * 0.9, 90)
+                sm = _RE_YT_SPEED.search(text)
+                zm = _RE_YT_SIZE.search(text)
+                if m:
+                    msg = f"{state.tasks[task_id]['progress']:.0f}%"
+                    if zm:
+                        msg += f" of {zm.group(1)}"
+                    if sm:
+                        msg += f" ({sm.group(1)})"
+                    state.tasks[task_id]["message"] = msg
+                if "Merging" in text or "muxing" in text.lower():
+                    state.tasks[task_id]["progress"] = 90
+                    state.tasks[task_id]["message"] = "Merging..."
+                if "[ExtractAudio]" in text:
+                    state.tasks[task_id]["progress"] = 85
+                    state.tasks[task_id]["message"] = "Extracting audio..."
+
+            buf = bytearray()
             while True:
                 chunk = await process.stdout.read(4096)
                 if not chunk:
                     break
-                buffer += chunk.decode("utf-8", errors="ignore")
-                lines = buffer.split("\n")
-                buffer = lines[-1]
-                for text in lines[:-1]:
-                    text = text.strip()
-                    if not text:
-                        continue
-                    m = _RE_YT_PROGRESS.search(text)
-                    if m:
-                        progress = float(m.group(1))
-                        state.tasks[task_id]["progress"] = min(progress * 0.9, 90)
-                    sm = _RE_YT_SPEED.search(text)
-                    zm = _RE_YT_SIZE.search(text)
-                    if m:
-                        msg = f"{state.tasks[task_id]['progress']:.0f}%"
-                        if zm:
-                            msg += f" of {zm.group(1)}"
-                        if sm:
-                            msg += f" ({sm.group(1)})"
-                        state.tasks[task_id]["message"] = msg
-                    if "Merging" in text or "muxing" in text.lower():
-                        state.tasks[task_id]["progress"] = 90
-                        state.tasks[task_id]["message"] = "Merging..."
-                    if "[ExtractAudio]" in text:
-                        state.tasks[task_id]["progress"] = 85
-                        state.tasks[task_id]["message"] = "Extracting audio..."
+                buf.extend(chunk)
+                while True:
+                    i_n = buf.find(b"\n")
+                    i_r = buf.find(b"\r")
+                    if i_n == -1 and i_r == -1:
+                        break
+                    if i_r != -1 and (i_n == -1 or i_r < i_n):
+                        line = bytes(buf[:i_r])
+                        del buf[: i_r + 1]
+                        if buf and buf[0] == 0x0A:
+                            del buf[:1]
+                    else:
+                        line = bytes(buf[:i_n])
+                        del buf[: i_n + 1]
+                    _apply_yt_line(line.decode("utf-8", errors="ignore"))
+            if buf:
+                _apply_yt_line(buf.decode("utf-8", errors="ignore"))
 
             await process.wait()
             download_time = (datetime.now() - start_time).total_seconds()
