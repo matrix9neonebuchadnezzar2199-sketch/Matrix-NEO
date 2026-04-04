@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import enum
-from datetime import datetime
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field
+
+from app.utils.timeutil import utcnow_iso
 
 
 class DownloadRequest(BaseModel):
@@ -55,7 +56,7 @@ class TaskState(BaseModel):
     format: Optional[str] = None  # YouTube: "mp4" | "mp3"
     thumbnail_url: Optional[str] = None
     file_size: Optional[int] = None
-    created_at: str = Field(default_factory=lambda: datetime.now().isoformat())
+    created_at: str = Field(default_factory=utcnow_iso)
     completed_at: Optional[str] = None
     stopped_at: Optional[str] = None
 

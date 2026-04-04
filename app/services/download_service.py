@@ -8,7 +8,6 @@ import os
 import re
 import time
 from collections import deque
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
@@ -18,6 +17,7 @@ import httpx
 from app import config as cfg
 from app.constants import (
     HTTP_CHUNK_SIZE,
+    MAX_ERROR_MSG_LEN,
     MIN_VALID_FILE_BYTES,
     PROGRESS_DIRECT_DL_CAP,
     PROGRESS_DL_CAP,
@@ -30,10 +30,12 @@ from app.constants import (
 from app.models import TaskStatus
 from app.services import http_client
 from app.state import tm
+from app.utils.disk import check_disk_space
 from app.utils.file_ops import replace_or_move_overwrite
 from app.utils.filename import sanitize_filename_for_windows
 from app.utils.paths import FFMPEG, N_M3U8DL_RE
 from app.utils.process import stderr_tail, subprocess_exit_code
+from app.utils.timeutil import utcnow_iso
 from app.utils.url_connection import url_with_pinned_ip
 
 logger = logging.getLogger(__name__)
@@ -157,22 +159,38 @@ async def _run_progressive(
 
     dest_str = str(output_path)
     tmp = dest_str + ".part"
-    try:
-        if os.path.isfile(tmp):
-            os.remove(tmp)
-    except OSError:
-        pass
+
+    # --- HTTP Range resume: reuse existing .part file ---
+    existing_bytes = 0
+    if os.path.isfile(tmp):
+        existing_bytes = os.path.getsize(tmp)
+        if existing_bytes > 0:
+            headers["Range"] = f"bytes={existing_bytes}-"
+            logger.info("Resuming from %s bytes: %s", existing_bytes, os.path.basename(tmp))
 
     timeout = httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=30.0)
     client = http_client.get_client()
     try:
         async with client.stream("GET", req_url, headers=headers, timeout=timeout) as response:
-            if response.status_code < 200 or response.status_code >= 400:
-                logger.warning("direct HTTP status=%s", response.status_code)
+            status = response.status_code
+
+            # If server does not support Range, start fresh
+            if existing_bytes > 0 and status != 206:
+                existing_bytes = 0
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+
+            if status not in (200, 206):
+                logger.warning("direct HTTP status=%s", status)
                 return None
-            total = int(response.headers.get("content-length") or 0)
-            downloaded = 0
-            with open(tmp, "wb") as f:
+
+            cl = int(response.headers.get("content-length") or 0)
+            total = (existing_bytes + cl) if status == 206 else cl
+            downloaded = existing_bytes
+            mode = "ab" if existing_bytes > 0 and status == 206 else "wb"
+            with open(tmp, mode) as f:
                 async for chunk in response.aiter_bytes(chunk_size=HTTP_CHUNK_SIZE):
                     if not chunk:
                         continue
@@ -217,12 +235,8 @@ async def _run_progressive(
         await tm.update(task_id, status=TaskStatus.ERROR, message="Timed out")
     except Exception as e:
         logger.exception("direct HTTP: %s", e)
-        await tm.update(task_id, status=TaskStatus.ERROR, message=str(e)[:80])
-    try:
-        if os.path.isfile(tmp):
-            os.remove(tmp)
-    except OSError:
-        pass
+        await tm.update(task_id, status=TaskStatus.ERROR, message=str(e)[:MAX_ERROR_MSG_LEN])
+    # Keep .part file for potential resume (do NOT delete)
     return None
 
 
@@ -516,18 +530,19 @@ async def _run_m3u8(
     return Path(raw_output), killed_stall
 
 
-async def _enqueue_or_complete_hls(
+async def _finalize_with_optional_thumbnail(
     task_id: str,
     filename: str,
-    output_path: Path,
+    video_path: str,
     file_size: int,
-    size_mb: float,
-    speed_mbps: float,
     download_time: float,
     thumbnail_url: Optional[str],
     cookie: Optional[str],
     referer: Optional[str],
 ) -> None:
+    """Shared finalization: update file_size, enqueue thumbnail or mark completed."""
+    size_mb = file_size / (1024 * 1024)
+    speed_mbps = size_mb / download_time if download_time > 0 else 0
     await tm.update(task_id, file_size=file_size)
     if thumbnail_url and tm.thumb_queue:
         await asyncio.sleep(THUMB_QUEUE_DELAY_SEC)
@@ -539,7 +554,7 @@ async def _enqueue_or_complete_hls(
         )
         await tm.thumb_queue.put(
             {
-                "video_path": str(output_path),
+                "video_path": video_path,
                 "thumb_url": thumbnail_url,
                 "task_id": task_id,
                 "cookie": cookie,
@@ -558,7 +573,7 @@ async def _enqueue_or_complete_hls(
             status=TaskStatus.COMPLETED,
             progress=100.0,
             message=f"Done! {size_mb:.1f}MB ({speed_mbps:.1f}MB/s)",
-            completed_at=datetime.now().isoformat(),
+            completed_at=utcnow_iso(),
         )
         logger.info("Completed: %s [no thumb]", filename)
 
@@ -580,50 +595,19 @@ async def _postprocess_and_finalize(
 
     if from_progressive:
         file_size = os.path.getsize(outp)
-        size_mb = file_size / (1024 * 1024)
-        speed_mbps = size_mb / download_time if download_time > 0 else 0
         await tm.update(
             task_id,
             progress=float(PROGRESS_DIRECT_DL_CAP),
             file_size=file_size,
         )
-        if thumbnail_url and tm.thumb_queue:
-            await asyncio.sleep(THUMB_QUEUE_DELAY_SEC)
-            await tm.update(
-                task_id,
-                status=TaskStatus.THUMBNAIL,
-                progress=float(PROGRESS_THUMB_QUEUE),
-                message=f"Done DL ({size_mb:.1f}MB) - Processing thumbnail...",
-            )
-            await tm.thumb_queue.put(
-                {
-                    "video_path": outp,
-                    "thumb_url": thumbnail_url,
-                    "task_id": task_id,
-                    "cookie": cookie,
-                    "referer": referer,
-                }
-            )
-            logger.info(
-                "Completed: %s (%.1f MB, %.1f MB/s) thumb queued",
-                filename,
-                size_mb,
-                speed_mbps,
-            )
-        else:
-            await tm.update(
-                task_id,
-                status=TaskStatus.COMPLETED,
-                progress=100.0,
-                message=f"Done! {size_mb:.1f}MB ({speed_mbps:.1f}MB/s)",
-                completed_at=datetime.now().isoformat(),
-            )
-            logger.info("Completed: %s [no thumb]", filename)
+        await _finalize_with_optional_thumbnail(
+            task_id, filename, outp, file_size, download_time,
+            thumbnail_url, cookie, referer,
+        )
         return
 
     file_size = os.path.getsize(raw_s)
     size_mb = file_size / (1024 * 1024)
-    speed_mbps = size_mb / download_time if download_time > 0 else 0
 
     if not raw_s.endswith(".mp4"):
         await tm.update(
@@ -637,8 +621,7 @@ async def _postprocess_and_finalize(
         if await _remux_ts_to_mp4(raw_s, output_path):
             os.remove(raw_s)
             file_size = os.path.getsize(outp)
-            size_mb = file_size / (1024 * 1024)
-            logger.info("Remux done: %s (%.1fMB)", filename, size_mb)
+            logger.info("Remux done: %s (%.1fMB)", filename, file_size / (1024 * 1024))
         else:
             logger.warning("Remux failed, keeping original: %s", os.path.basename(raw_s))
             if raw_s != outp:
@@ -653,22 +636,13 @@ async def _postprocess_and_finalize(
         logger.info("Normalizing MP4: %s", filename)
         if await ffmpeg_normalize_container_to_mp4(outp):
             file_size = os.path.getsize(outp)
-            size_mb = file_size / (1024 * 1024)
-            logger.info("MP4 normalized OK (%.1fMB)", size_mb)
+            logger.info("MP4 normalized OK (%.1fMB)", file_size / (1024 * 1024))
         else:
             logger.warning("MP4 normalize failed — thumbnail embed may fail")
 
-    await _enqueue_or_complete_hls(
-        task_id,
-        filename,
-        output_path,
-        file_size,
-        size_mb,
-        speed_mbps,
-        download_time,
-        thumbnail_url,
-        cookie,
-        referer,
+    await _finalize_with_optional_thumbnail(
+        task_id, filename, outp, file_size, download_time,
+        thumbnail_url, cookie, referer,
     )
 
 
@@ -684,8 +658,16 @@ async def run_download(
 ) -> None:
     _ = request_quality
     async with tm.semaphore:
-        wall_start = datetime.now()
+        wall_start = time.monotonic()
         try:
+            # Disk space check before starting download
+            disk_ok, free_bytes = check_disk_space()
+            if not disk_ok:
+                free_mb = free_bytes / (1024 * 1024)
+                msg = f"Low disk space: {free_mb:.0f}MB free (need {cfg.MIN_FREE_DISK_MB}MB)"
+                await tm.update(task_id, status=TaskStatus.ERROR, message=msg)
+                logger.error("Disk space check failed: %s", msg)
+                return
             filename = sanitize_filename_for_windows(filename)
             await tm.update(task_id, filename=filename, status=TaskStatus.DOWNLOADING, message="Starting...")
             output_path = cfg.OUTPUT_DIR / filename
@@ -695,7 +677,7 @@ async def run_download(
                 raw = await _run_progressive(
                     task_id, url, output_path, cookie, referer, resolved_ips=resolved_ips
                 )
-                download_time = (datetime.now() - wall_start).total_seconds()
+                download_time = time.monotonic() - wall_start
                 if raw and raw.exists() and raw.stat().st_size >= MIN_VALID_FILE_BYTES:
                     # _run_progressive may have already set ERROR on httpx failures; re-check task
                     t = tm.get(task_id)
@@ -722,7 +704,7 @@ async def run_download(
             raw_result, killed_stall = await _run_m3u8(
                 task_id, url, filename, output_path, cookie, referer
             )
-            download_time = (datetime.now() - wall_start).total_seconds()
+            download_time = time.monotonic() - wall_start
 
             if raw_result and raw_result.exists() and raw_result.stat().st_size > MIN_VALID_FILE_BYTES:
                 await _postprocess_and_finalize(
@@ -759,7 +741,7 @@ async def run_download(
             await tm.update(task_id, status=TaskStatus.ERROR, message="Cancelled")
             raise
         except Exception as e:
-            await tm.update(task_id, status=TaskStatus.ERROR, message=str(e)[:80])
+            await tm.update(task_id, status=TaskStatus.ERROR, message=str(e)[:MAX_ERROR_MSG_LEN])
             logger.exception("run_download: %s", e)
         finally:
             tm.active_downloads.pop(task_id, None)

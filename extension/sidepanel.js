@@ -4,58 +4,15 @@
 const MATRIX_NEO_SERVER_LAUNCH_URL = 'matrixneo://run-server/';
 
 let serverUrl = 'http://localhost:6850';
+let authToken = '';
 let detectedVideos = new Map();
 let downloadTasks = new Map();
 let selectedQualities = new Map();
 let savedList = [];
+let sseConnection = null;
 
 
-// === DL済み判定用ユーティリティ ===
-function extractVideoIdFromUrl(url) {
-  try {
-    const u = new URL(url);
-    // YouTube: ?v=xxx パラメータ
-    if (u.searchParams.has('v')) return 'yt:' + u.searchParams.get('v');
-    // surrit等: UUID部分を抽出 (例: /680b448c-df5a-4687-b916-07fdf01a96ff/)
-    const uuidMatch = u.pathname.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
-    if (uuidMatch) return 'uuid:' + uuidMatch[1];
-    // その他: origin + パスからクエリ・品質部分を除去
-    const cleanPath = u.pathname.replace(/\/(1080p|720p|480p|360p)\/video\.m3u8.*$/, '').replace(/\/playlist\.m3u8.*$/, '');
-    return u.origin + cleanPath;
-  } catch {
-    return url;
-  }
-}
-
-function isDownloadedUrl(videoUrl, history) {
-  const targetId = extractVideoIdFromUrl(videoUrl);
-  return history.some(item => extractVideoIdFromUrl(item.url) === targetId);
-}
-
-function normalizeUrl(u) {
-  if (!u) return '';
-  try {
-    const x = new URL(u);
-    return x.href.replace(/#.*$/, '');
-  } catch {
-    return u;
-  }
-}
-
-/** 検出動画の長さ表示（秒 → H:MM:SS / M:SS） */
-function formatDurationLabel(sec) {
-  if (sec == null || typeof sec !== 'number' || !Number.isFinite(sec) || sec <= 0) {
-    return '';
-  }
-  const s = Math.floor(sec);
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const r = s % 60;
-  if (h > 0) {
-    return h + ':' + String(m).padStart(2, '0') + ':' + String(r).padStart(2, '0');
-  }
-  return m + ':' + String(r).padStart(2, '0');
-}
+// Utility functions are loaded from utils.js
 
 async function resolvePageUrlForDownload(video) {
   if (video.pageUrl) return normalizeUrl(video.pageUrl);
@@ -104,7 +61,7 @@ async function loadProxiedThumbnails() {
         try {
             const pageUrl = await resolvePageUrlForDownload(video);
             const cookie = await buildCookieHeaderForDownload(pageUrl);
-            const res = await fetch(base + '/proxy-image', {
+            const res = await authFetch(base + '/proxy-image', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -128,6 +85,64 @@ async function loadProxiedThumbnails() {
 }
 
 
+/** Fetch wrapper that adds Bearer auth header when token is configured. */
+function authFetch(url, options = {}) {
+    if (authToken) {
+        options.headers = options.headers || {};
+        if (typeof options.headers === 'object' && !(options.headers instanceof Headers)) {
+            options.headers['Authorization'] = 'Bearer ' + authToken;
+        }
+    }
+    return fetch(url, options);
+}
+
+// === SSE Connection for real-time task updates ===
+function connectSSE() {
+    if (sseConnection) {
+        sseConnection.close();
+        sseConnection = null;
+    }
+    const sseUrl = serverUrl + '/tasks/events' + (authToken ? '?token=' + encodeURIComponent(authToken) : '');
+    const es = new EventSource(sseUrl);
+    sseConnection = es;
+
+    es.addEventListener('task-update', (e) => {
+        try {
+            const task = JSON.parse(e.data);
+            const existing = downloadTasks.get(task.task_id);
+            const isNew = !existing;
+            const statusChanged = existing && existing.status !== task.status;
+            downloadTasks.set(task.task_id, task);
+
+            // Process newly completed tasks
+            if (task.status === 'completed' && task.filename && (isNew || statusChanged)) {
+                addToSavedList(task.filename);
+                addToHistory(task);
+                updateSavedListDisplay();
+                removeCompletedFromQueue(task.filename, task.url);
+            }
+            updateTasksOnly();
+        } catch (err) {
+            console.warn('[MATRIX-M] SSE task-update parse error:', err);
+        }
+    });
+
+    es.addEventListener('task-remove', (e) => {
+        try {
+            const data = JSON.parse(e.data);
+            downloadTasks.delete(data.task_id);
+            updateTasksOnly();
+        } catch (err) {}
+    });
+
+    es.onerror = () => {
+        es.close();
+        sseConnection = null;
+        // Reconnect after 3 seconds
+        setTimeout(connectSSE, 3000);
+    };
+}
+
 document.addEventListener('DOMContentLoaded', () => {
     console.log('[MATRIX-M] DOMContentLoaded fired');
     init();
@@ -135,9 +150,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
 async function init() {
     try {
-        const result = await chrome.storage.local.get(['serverUrl', 'savedList']);
+        const result = await chrome.storage.local.get(['serverUrl', 'savedList', 'authToken']);
         if (result.serverUrl) serverUrl = result.serverUrl;
         if (result.savedList) savedList = result.savedList;
+        if (result.authToken) authToken = result.authToken;
         document.getElementById('serverUrl').value = serverUrl;
     } catch (e) {}
 
@@ -188,8 +204,12 @@ async function init() {
 
     document.getElementById('saveSettings').onclick = async () => {
         serverUrl = document.getElementById('serverUrl').value;
-        await chrome.storage.local.set({ serverUrl });
+        const tokenInput = document.getElementById('authToken');
+        if (tokenInput) authToken = tokenInput.value.trim();
+        await chrome.storage.local.set({ serverUrl, authToken });
         document.getElementById('settingsModal').classList.remove('show');
+        // Reconnect SSE with new settings
+        connectSSE();
     };
 
     document.getElementById('testConnection').onclick = async () => {
@@ -222,8 +242,11 @@ async function init() {
     checkServer();
     checkVpnStatus();
 
+    // Use SSE for real-time task updates instead of 1s polling
+    connectSSE();
+    // Fallback: poll tasks at a slower rate in case SSE disconnects
+    setInterval(loadServerTasks, 10000);
     setInterval(loadVideos, 5000);
-    setInterval(loadServerTasks, 1000);
     setInterval(checkServer, 10000);
     setInterval(checkVpnStatus, 30000);
 }
@@ -247,7 +270,7 @@ async function checkVpnStatus() {
     if (!el) return;
     
     try {
-        const res = await fetch(serverUrl + '/vpn-status');
+        const res = await authFetch(serverUrl + '/vpn-status');
         const data = await res.json();
         
         if (data.success) {
@@ -277,13 +300,7 @@ async function checkVpnStatus() {
     }
 }
 
-function getCountryFlag(countryCode) {
-    if (!countryCode || countryCode.length !== 2) return '';
-    const offset = 127397;
-    const firstChar = countryCode.toUpperCase().charCodeAt(0);
-    const secondChar = countryCode.toUpperCase().charCodeAt(1);
-    return String.fromCodePoint(firstChar + offset) + String.fromCodePoint(secondChar + offset);
-}
+// getCountryFlag is in utils.js
 
 
 // Queue functions
@@ -433,7 +450,7 @@ async function loadVpnDetails() {
     warningBox.style.display = 'none';
     
     try {
-        const res = await fetch(serverUrl + '/vpn-status');
+        const res = await authFetch(serverUrl + '/vpn-status');
         const data = await res.json();
         
         if (data.success) {
@@ -481,14 +498,7 @@ async function loadVpnDetails() {
     }
 }
 
-function extractVideoIdFromFilename(filename) {
-    const patterns = [/FC2-PPV-(\d+)/i, /FC2PPV-(\d+)/i, /FC2-(\d+)/i, /([A-Z]+-\d+)/i, /(\d{6,})/];
-    for (const pattern of patterns) {
-        const match = filename.match(pattern);
-        if (match) return match[0].toUpperCase().replace('FC2PPV', 'FC2-PPV');
-    }
-    return filename.replace(/\.[^.]+$/, '').substring(0, 30);
-}
+// extractVideoIdFromFilename is in utils.js
 
 function isAlreadySaved(title) {
     if (!title || savedList.length === 0) return false;
@@ -575,7 +585,7 @@ function updateSavedListDisplay() {
 
 async function loadServerTasks() {
     try {
-        const res = await fetch(serverUrl + '/tasks');
+        const res = await authFetch(serverUrl + '/tasks');
         const data = await res.json();
         if (data.tasks) {
             const newTasks = new Map();
@@ -596,16 +606,11 @@ async function loadServerTasks() {
                             removeCompletedFromQueue(task.filename, task.url);
                         }
                     }
-                    // Keep completed/error tasks visible, delete after 5 seconds
+                    // Keep completed/error tasks visible (server GC handles cleanup)
                     newTasks.set(task.task_id, task);
                     const existingTask = downloadTasks.get(task.task_id);
                     if (!existingTask || existingTask.status !== task.status) {
                         changed = true;
-                    }
-                    if (!existingTask) {
-                        setTimeout(() => { 
-                            fetch(serverUrl + '/task/' + task.task_id, { method: 'DELETE' }).catch(() => {}); 
-                        }, 5000);
                     }
                 } else {
                     newTasks.set(task.task_id, task);
@@ -895,7 +900,7 @@ async function startDownload(video, url) {
                 thumbnail: true
             };
 
-            const res = await fetch(serverUrl + '/youtube/download', {
+            const res = await authFetch(serverUrl + '/youtube/download', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(body)
@@ -920,7 +925,7 @@ async function startDownload(video, url) {
             body.referer = pageUrl;
         }
 
-        const res = await fetch(serverUrl + '/download', {
+        const res = await authFetch(serverUrl + '/download', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body)
@@ -1042,7 +1047,7 @@ function bindHistoryEvents() {
                     const body = { url: item.url, filename: item.filename, format_type: 'mp4' };
                     if (item.thumbnail_url) body.thumbnail_url = item.thumbnail_url;
                     
-                    await fetch(serverUrl + '/download', {
+                    await authFetch(serverUrl + '/download', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify(body)
@@ -1081,21 +1086,19 @@ document.getElementById('clearHistory').onclick = async function() {
     }
 };
 
-function escapeHtml(str) {
-    return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}
+// escapeHtml is in utils.js
 
 // Stop/Resume Functions
 async function stopTask(taskId) {
     try {
-        const res = await fetch(serverUrl + '/task/' + taskId + '/stop', { method: 'POST' });
+        const res = await authFetch(serverUrl + '/task/' + taskId + '/stop', { method: 'POST' });
         if (res.ok) await loadServerTasks();
     } catch (e) { alert('Error: ' + e.message); }
 }
 
 async function resumeTask(taskId) {
     try {
-        const res = await fetch(serverUrl + '/task/' + taskId + '/resume', { method: 'POST' });
+        const res = await authFetch(serverUrl + '/task/' + taskId + '/resume', { method: 'POST' });
         if (res.ok) await loadServerTasks();
     } catch (e) { alert('Error: ' + e.message); }
 }
@@ -1103,14 +1106,14 @@ async function resumeTask(taskId) {
 async function stopAllTasks() {
     if (!confirm('Stop all downloads?')) return;
     try {
-        await fetch(serverUrl + '/tasks/stop-all', { method: 'POST' });
+        await authFetch(serverUrl + '/tasks/stop-all', { method: 'POST' });
         await loadServerTasks();
     } catch (e) { alert('Error: ' + e.message); }
 }
 
 async function clearStoppedTasks() {
     try {
-        await fetch(serverUrl + '/tasks/clear-stopped', { method: 'DELETE' });
+        await authFetch(serverUrl + '/tasks/clear-stopped', { method: 'DELETE' });
         await loadServerTasks();
     } catch (e) { alert('Error: ' + e.message); }
 }
@@ -1124,7 +1127,7 @@ async function clearCompletedTasks() {
     });
     
     for (const taskId of completedIds) {
-        await fetch(serverUrl + '/task/' + taskId, { method: 'DELETE' }).catch(() => {});
+        await authFetch(serverUrl + '/task/' + taskId, { method: 'DELETE' }).catch(() => {});
         downloadTasks.delete(taskId);
     }
     
@@ -1134,7 +1137,7 @@ async function clearCompletedTasks() {
 
 async function deleteTask(taskId) {
     try {
-        await fetch(serverUrl + '/task/' + taskId, { method: 'DELETE' });
+        await authFetch(serverUrl + '/task/' + taskId, { method: 'DELETE' });
         downloadTasks.delete(taskId);
         updateTasksOnly();
     } catch (e) { alert('Error: ' + e.message); }

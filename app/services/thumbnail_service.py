@@ -7,7 +7,6 @@ import logging
 import os
 import shutil
 import sys
-from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -259,9 +258,10 @@ async def thumbnail_worker() -> None:
                         message="Embedding thumbnail...",
                     )
 
-                start = datetime.now()
+                import time as _time
+                _t0 = _time.monotonic()
                 success = await embed_thumbnail(vpath, Path(thumb_path), task_id)
-                elapsed = (datetime.now() - start).total_seconds()
+                elapsed = _time.monotonic() - _t0
 
                 if success:
                     logger.info(
@@ -276,7 +276,7 @@ async def thumbnail_worker() -> None:
                             status=TaskStatus.COMPLETED,
                             progress=100.0,
                             message=f"Done! {size_mb:.1f}MB [+thumb]",
-                            completed_at=datetime.now().isoformat(),
+                            completed_at=utcnow_iso(),
                         )
                 else:
                     logger.warning("THUMB-WORKER failed embed: %s", os.path.basename(video_path))
@@ -288,7 +288,7 @@ async def thumbnail_worker() -> None:
                             status=TaskStatus.COMPLETED,
                             progress=100.0,
                             message=f"{prev} [no thumb]",
-                            completed_at=datetime.now().isoformat(),
+                            completed_at=utcnow_iso(),
                         )
 
                 try:
@@ -308,7 +308,7 @@ async def thumbnail_worker() -> None:
                         status=TaskStatus.COMPLETED,
                         progress=100.0,
                         message=f"{prev} [thumb failed]",
-                        completed_at=datetime.now().isoformat(),
+                        completed_at=utcnow_iso(),
                     )
 
         except Exception:
@@ -323,7 +323,7 @@ async def thumbnail_worker() -> None:
                         status=TaskStatus.COMPLETED,
                         progress=100.0,
                         message=f"{prev} [thumb error]",
-                        completed_at=datetime.now().isoformat(),
+                        completed_at=utcnow_iso(),
                     )
         finally:
             if tm.thumb_queue is not None and job is not None:

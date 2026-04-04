@@ -35,6 +35,26 @@ async function getServerUrl() {
     }
 }
 
+/** Return saved auth token (empty string = disabled). */
+async function getAuthToken() {
+    try {
+        const result = await chrome.storage.local.get(['authToken']);
+        return result.authToken || '';
+    } catch {
+        return '';
+    }
+}
+
+/** Fetch wrapper that adds Bearer auth header when token is configured. */
+async function bgAuthFetch(url, options = {}) {
+    const token = await getAuthToken();
+    if (token) {
+        options.headers = options.headers || {};
+        options.headers['Authorization'] = 'Bearer ' + token;
+    }
+    return fetch(url, options);
+}
+
 /**
  * yt-dlp サイトの品質をサーバー /youtube/info 経由で動的取得。
  */
@@ -45,9 +65,12 @@ async function fetchYtDlpQualities(url) {
         const tid = setTimeout(() => controller.abort(), 15000);
         let res;
         try {
+            const token = await getAuthToken();
+            const fetchOpts = { signal: controller.signal };
+            if (token) fetchOpts.headers = { 'Authorization': 'Bearer ' + token };
             res = await fetch(
                 base + '/youtube/info?url=' + encodeURIComponent(url),
-                { signal: controller.signal }
+                fetchOpts
             );
         } finally {
             clearTimeout(tid);

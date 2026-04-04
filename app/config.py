@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 import sys
 from pathlib import Path
 
@@ -55,6 +56,17 @@ TASK_GC_INTERVAL_SEC = float(os.environ.get("MATRIX_NEO_TASK_GC_INTERVAL_SEC", "
 
 LOG_LEVEL = os.environ.get("MATRIX_NEO_LOG_LEVEL", "INFO").upper()
 
+# Authentication: Bearer token (empty = disabled for backward compat)
+AUTH_TOKEN: str = os.environ.get("MATRIX_NEO_AUTH_TOKEN", "").strip()
+AUTH_TOKEN_AUTO: bool = _bool_env("MATRIX_NEO_AUTH_TOKEN_AUTO", default=False)
+
+# If AUTO is enabled and no token is set, generate one on startup
+if AUTH_TOKEN_AUTO and not AUTH_TOKEN:
+    AUTH_TOKEN = secrets.token_urlsafe(32)
+
+# Thumbnail worker concurrency
+THUMB_WORKERS: int = max(1, int(os.environ.get("MATRIX_NEO_THUMB_WORKERS", "2")))
+
 DEFAULT_UA = os.environ.get(
     "MATRIX_NEO_M3U8_USER_AGENT",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -65,6 +77,9 @@ PROXY_IMAGE_RATE_LIMIT = int(os.environ.get("MATRIX_NEO_PROXY_IMAGE_RATE_LIMIT",
 PROXY_IMAGE_RATE_WINDOW_SEC = float(
     os.environ.get("MATRIX_NEO_PROXY_IMAGE_RATE_WINDOW_SEC", "60")
 )
+
+# Disk space check
+MIN_FREE_DISK_MB: int = max(100, int(os.environ.get("MATRIX_NEO_MIN_FREE_DISK_MB", "500")))
 
 _default_vpn_kw = (
     "vpn,nord,express,surfshark,private,proxy,hosting,server,data center,datacenter,"

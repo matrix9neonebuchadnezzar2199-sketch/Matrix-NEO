@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
 
 from fastapi import APIRouter
 
@@ -14,6 +13,7 @@ from app.services import download_service
 from app.state import tm
 from app.task_id import new_task_id
 from app.utils.filename import sanitize_filename_for_windows
+from app.utils.timeutil import utcnow_iso
 from app.utils.validation import validate_http_url
 
 router = APIRouter(tags=["download"])
@@ -46,7 +46,7 @@ async def download(request: DownloadRequest):
             status=TaskStatus.QUEUED,
             progress=0.0,
             message="Queue...",
-            created_at=datetime.now().isoformat(),
+            created_at=utcnow_iso(),
         ),
         credentials={"cookie": request.cookie, "referer": request.referer},
     )

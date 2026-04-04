@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app import __version__
 from app import config as cfg
 from app.logging_setup import setup_logging
+from app.middleware.auth import BearerAuthMiddleware
 from app.routes import download, events, health, proxy, stop_resume, tasks_read, youtube
 from app.services import http_client
 from app.services import task_gc
@@ -30,7 +31,8 @@ async def lifespan(app: FastAPI):
     os.makedirs(cfg.TEMP_DIR, exist_ok=True)
     tm.thumb_queue = asyncio.Queue()
     bg_tasks: list[asyncio.Task] = []
-    bg_tasks.append(asyncio.create_task(thumbnail_worker()))
+    for _ in range(cfg.THUMB_WORKERS):
+        bg_tasks.append(asyncio.create_task(thumbnail_worker()))
     bg_tasks.append(asyncio.create_task(task_gc.task_gc_worker()))
 
     logger.info(
@@ -52,6 +54,14 @@ async def lifespan(app: FastAPI):
         "on" if cfg.M3U8_MUX_TS else "off",
     )
     logger.info("YouTube support: enabled")
+    logger.info(
+        "thumbnail_workers=%s auth=%s min_free_disk=%sMB",
+        cfg.THUMB_WORKERS,
+        "token" if cfg.AUTH_TOKEN else "off",
+        cfg.MIN_FREE_DISK_MB,
+    )
+    if cfg.AUTH_TOKEN and cfg.AUTH_TOKEN_AUTO:
+        logger.info("Auto-generated auth token: %s", cfg.AUTH_TOKEN)
 
     yield
 
@@ -64,6 +74,9 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     app = FastAPI(title="MATRIX-NEO Server", lifespan=lifespan, version=__version__)
+
+    # Auth middleware (no-op when AUTH_TOKEN is empty)
+    app.add_middleware(BearerAuthMiddleware)
 
     # Local tool + Chrome extension: regex avoids wildcard credential issues with "*"
     app.add_middleware(
