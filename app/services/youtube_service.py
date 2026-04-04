@@ -9,13 +9,13 @@ import os
 import re
 import time
 from collections import OrderedDict
-from datetime import datetime
 from typing import Optional
 
 from fastapi import HTTPException
 
 from app import config as cfg
 from app.constants import (
+    MAX_ERROR_MSG_LEN,
     YT_JSON_CACHE_MAX,
     YT_META_TTL_SEC,
     YT_PROGRESS_CAP,
@@ -26,7 +26,9 @@ from app.constants import (
 from app.models import TaskStatus
 from app.services.download_service import terminate_child_process
 from app.state import tm
+from app.utils.disk import check_disk_space
 from app.utils.paths import YTDLP
+from app.utils.timeutil import utcnow_iso
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +115,14 @@ async def run_youtube_download(
     async with tm.semaphore:
         process: Optional[asyncio.subprocess.Process] = None
         try:
+            # Disk space check
+            disk_ok, free_bytes = check_disk_space()
+            if not disk_ok:
+                free_mb = free_bytes / (1024 * 1024)
+                msg = f"Low disk space: {free_mb:.0f}MB free (need {cfg.MIN_FREE_DISK_MB}MB)"
+                await tm.update(task_id, status=TaskStatus.ERROR, message=msg)
+                return
+
             await tm.update(
                 task_id,
                 status=TaskStatus.DOWNLOADING,
@@ -160,7 +170,7 @@ async def run_youtube_download(
                 ]
 
             logger.info("YT starting: %s (%s, %s)", filename, format_type, quality)
-            start_time = datetime.now()
+            start_time = time.monotonic()
 
             process = await asyncio.create_subprocess_exec(
                 *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
@@ -222,7 +232,7 @@ async def run_youtube_download(
                 await _apply_yt_line(buf.decode("utf-8", errors="ignore"))
 
             await process.wait()
-            download_time = (datetime.now() - start_time).total_seconds()
+            download_time = time.monotonic() - start_time
 
             actual_output = output_path
             if not os.path.exists(output_path):
@@ -242,7 +252,7 @@ async def run_youtube_download(
                     status=TaskStatus.COMPLETED,
                     progress=100.0,
                     message=f"Done! {size_mb:.1f}MB ({speed_mbps:.1f}MB/s)",
-                    completed_at=datetime.now().isoformat(),
+                    completed_at=utcnow_iso(),
                 )
                 logger.info("YT completed: %s (%.1fMB in %.1fs)", filename, size_mb, download_time)
             else:
@@ -255,7 +265,7 @@ async def run_youtube_download(
             await tm.update(task_id, status=TaskStatus.ERROR, message="Cancelled")
             raise
         except Exception as e:
-            await tm.update(task_id, status=TaskStatus.ERROR, message=str(e)[:50])
+            await tm.update(task_id, status=TaskStatus.ERROR, message=str(e)[:MAX_ERROR_MSG_LEN])
             logger.exception("YT error: %s", e)
         finally:
             tm.active_downloads.pop(task_id, None)

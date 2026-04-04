@@ -104,6 +104,10 @@
                 <div class="setting-group">
                     <label>Server URL</label>
                     <input type="text" id="serverUrl" value="http://localhost:6850">
+                </div>
+                <div class="setting-group">
+                    <label>Auth Token (optional)</label>
+                    <input type="password" id="authToken" placeholder="MATRIX_NEO_AUTH_TOKEN value">
                     <div class="setting-actions">
                         <button id="saveSettings" class="btn">Save</button>
                         <button id="testConnection" class="btn">Test</button>
@@ -121,6 +125,7 @@
         </div>
     </div>
 
+    <script src="utils.js"></script>
     <script src="sidepanel.js"></script>
 </body>
 </html>

@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from app import config as cfg
 from app.models import TaskStatus
 from app.state import tm
+from app.utils.timeutil import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +20,7 @@ async def task_gc_worker() -> None:
     while True:
         try:
             await asyncio.sleep(interval)
-            now = datetime.now()
+            now = utcnow()
             expired: list[str] = []
             for tid, t in list(tm.tasks.items()):
                 st = t.status
@@ -33,6 +34,9 @@ async def task_gc_worker() -> None:
                     continue
                 try:
                     ts = datetime.fromisoformat(ca)
+                    # Make naive datetimes comparable with aware ones
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
                 except ValueError:
                     continue
                 if now - ts > ttl:

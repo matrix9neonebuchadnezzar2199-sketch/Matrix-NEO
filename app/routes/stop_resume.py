@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
 
 from fastapi import APIRouter, HTTPException
 
@@ -14,6 +13,7 @@ from app.services import youtube_service
 from app.services.download_service import run_download
 from app.state import tm
 from app.task_id import new_task_id
+from app.utils.timeutil import utcnow_iso
 from app.utils.validation import validate_http_url
 
 router = APIRouter(tags=["tasks"])
@@ -51,7 +51,7 @@ async def stop_task(task_id: str):
         task_id,
         status=TaskStatus.STOPPED,
         message="Stopped",
-        stopped_at=datetime.now().isoformat(),
+        stopped_at=utcnow_iso(),
     )
 
     logger.info("Task stopped: %s", task_id)
@@ -82,7 +82,7 @@ async def resume_task(task_id: str):
                 quality=cur.quality,
                 thumbnail_url=cur.thumbnail_url,
                 format=cur.format,
-                created_at=datetime.now().isoformat(),
+                created_at=utcnow_iso(),
             ),
         )
         t = asyncio.create_task(
@@ -108,7 +108,7 @@ async def resume_task(task_id: str):
                 type=cur.type or "hls",
                 quality=cur.quality,
                 thumbnail_url=cur.thumbnail_url,
-                created_at=datetime.now().isoformat(),
+                created_at=utcnow_iso(),
             ),
             credentials={"cookie": ck, "referer": rk},
         )

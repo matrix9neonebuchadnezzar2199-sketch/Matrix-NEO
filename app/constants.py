@@ -3,6 +3,7 @@
 # --- File size thresholds ---
 MIN_VALID_FILE_BYTES: int = 1_048_576  # 1 MiB — below counts as failed download
 HTTP_CHUNK_SIZE: int = 262_144  # 256 KiB
+MIN_FREE_DISK_BYTES: int = 500 * 1024 * 1024  # 500 MiB — warn before download
 
 # --- Progress milestones (0–100) ---
 PROGRESS_DL_CAP: float = 80.0  # HLS download phase cap
@@ -29,3 +30,6 @@ TERMINATE_WAIT_SEC: float = 20.0
 # --- yt-dlp JSON cache ---
 YT_JSON_CACHE_MAX: int = 100
 YT_META_TTL_SEC: float = 300.0
+
+# --- Error message truncation ---
+MAX_ERROR_MSG_LEN: int = 120

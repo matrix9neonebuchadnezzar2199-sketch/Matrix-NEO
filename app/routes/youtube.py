@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from datetime import datetime
 
 from fastapi import APIRouter, HTTPException
 
@@ -14,6 +13,7 @@ from app.models import TaskState, TaskStatus, YouTubeRequest
 from app.services import youtube_service
 from app.state import tm
 from app.task_id import new_task_id
+from app.utils.timeutil import utcnow_iso
 from app.utils.validation import validate_http_url
 
 router = APIRouter(tags=["youtube"])
@@ -96,7 +96,7 @@ async def youtube_download(request: YouTubeRequest):
             format=ft,
             quality=request.quality,
             thumbnail_url=thumbnail_url if request.thumbnail else None,
-            created_at=datetime.now().isoformat(),
+            created_at=utcnow_iso(),
         ),
     )
 

@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
 
 import httpx
 from fastapi import APIRouter
 
 from app import __version__
 from app import config as cfg
+from app.utils.timeutil import utcnow_iso
 
 router = APIRouter(tags=["health"])
 logger = logging.getLogger(__name__)
@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 async def health():
     return {
         "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": utcnow_iso(),
         "version": __version__,
         "product": "MATRIX-NEO",
         "threads": cfg.MAX_THREADS,
