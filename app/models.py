@@ -60,5 +60,9 @@ class TaskState(BaseModel):
     stopped_at: Optional[str] = None
 
     def to_api_dict(self) -> dict[str, Any]:
-        """Secret-free dict for API responses (JSON-serializable)."""
-        return self.model_dump(mode="json", exclude_none=True)
+        """Secret-free dict for API responses (JSON-serializable).
+
+        Includes keys whose value is null so clients (e.g. Chrome extension) always see
+        the same shape as the pre-TaskState dict responses.
+        """
+        return self.model_dump(mode="json")

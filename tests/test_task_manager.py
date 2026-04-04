@@ -72,3 +72,10 @@ async def test_reset(mgr: TaskManager) -> None:
     await mgr.register(TaskState(task_id="z", url="u", filename="f.mp4"))
     mgr.reset()
     assert not mgr.tasks
+
+
+@pytest.mark.asyncio
+async def test_update_rejects_unknown_field(mgr: TaskManager) -> None:
+    await mgr.register(TaskState(task_id="bad", url="http://x", filename="a.mp4"))
+    with pytest.raises(ValueError, match="no field"):
+        await mgr.update("bad", not_a_real_field=123)

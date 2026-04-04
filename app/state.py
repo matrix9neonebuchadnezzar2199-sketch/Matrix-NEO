@@ -41,6 +41,9 @@ class TaskManager:
                 self.task_credentials[task.task_id] = credentials
 
     async def update(self, task_id: str, **fields: Any) -> None:
+        for k in fields:
+            if k not in TaskState.model_fields:
+                raise ValueError(f"TaskState has no field {k!r}")
         async with self._lock:
             t = self.tasks.get(task_id)
             if t is None:
