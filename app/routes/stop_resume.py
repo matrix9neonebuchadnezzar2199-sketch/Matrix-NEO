@@ -19,6 +19,9 @@ from app.utils.validation import validate_http_url
 router = APIRouter(tags=["tasks"])
 logger = logging.getLogger(__name__)
 
+# Task types handled by yt-dlp (YouTube, Dailymotion, other extractor sites)
+_YTDLP_TYPES = frozenset({"youtube", "yt-dlp"})
+
 
 @router.post("/task/{task_id}/stop")
 async def stop_task(task_id: str):
@@ -66,7 +69,7 @@ async def resume_task(task_id: str):
     ck, rk = cred.get("cookie"), cred.get("referer")
     new_id = new_task_id()
 
-    if cur.type == "youtube":
+    if cur.type in _YTDLP_TYPES:
         await tm.register(
             TaskState(
                 task_id=new_id,
@@ -75,7 +78,7 @@ async def resume_task(task_id: str):
                 filename=cur.filename,
                 message="Resuming...",
                 url=cur.url,
-                type="youtube",
+                type=cur.type,
                 quality=cur.quality,
                 thumbnail_url=cur.thumbnail_url,
                 format=cur.format,

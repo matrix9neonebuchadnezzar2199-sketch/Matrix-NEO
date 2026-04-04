@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "MATRIX-NEO_v2.0",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "M3U8/MPD/MP4/WebM 動画を検出してダウンロード",
 
   "permissions": [
@@ -35,7 +35,8 @@
         "*://*.missav.com/*",
         "*://*.pornhub.com/*",
         "*://*.xvideos.com/*",
-        "*://*.xhamster.com/*"
+        "*://*.xhamster.com/*",
+        "*://*.dailymotion.com/*"
       ],
       "js": ["content.js"],
       "css": ["content.css"],

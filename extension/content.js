@@ -44,6 +44,14 @@
             titleSelector: '.video-title',
             getVideoUrl: (link) => link.href,
             getTitle: (el) => el.querySelector('.video-title')?.textContent?.trim() || el.querySelector('img')?.alt || ''
+        },
+        'dailymotion.com': {
+            thumbSelector: '[class*="thumbnail"] img, .VideoCard img, .media img',
+            linkSelector: 'a[href*="/video/"]',
+            titleSelector: '.title, .VideoCard-title, h3, h4',
+            getVideoUrl: (link) => link.href,
+            getTitle: (el) => el.querySelector('.title, .VideoCard-title, h3, h4')?.textContent?.trim()
+                || el.querySelector('img')?.alt || ''
         }
     };
     

@@ -50,7 +50,7 @@ class TaskState(BaseModel):
     status: TaskStatus = TaskStatus.QUEUED
     progress: float = 0.0
     message: str = "Queue..."
-    type: str = "hls"  # "hls" | "youtube"
+    type: str = "hls"  # "hls" | "youtube" | "yt-dlp" (yt-dlp-backed downloads)
     quality: Optional[str] = None
     format: Optional[str] = None  # YouTube: "mp4" | "mp3"
     thumbnail_url: Optional[str] = None

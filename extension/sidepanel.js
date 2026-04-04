@@ -66,6 +66,7 @@ async function resolvePageUrlForDownload(video) {
     } catch (e) {}
   }
   if (video.isYouTube && video.url) return normalizeUrl(video.url);
+  if (video.isYtDlp && video.url) return normalizeUrl(video.url);
   return '';
 }
 
@@ -711,7 +712,6 @@ function updateTasksOnly() {
     updateEmptyMessage();
 }
 
-// ===== 変更後 =====
 async function renderVideosOnly() {
     const container = document.getElementById('videoList');
     let videosContainer = container.querySelector('.videos-section');
@@ -740,13 +740,22 @@ async function renderVideosOnly() {
         const savedQuality = selectedQualities.get(key);
 
         let options = '';
-        if (video.qualities && video.qualities.length > 0) {
+        if (video.isYtDlp || video.isYouTube) {
+            const quals = video.qualities && video.qualities.length > 0
+                ? video.qualities
+                : [{ label: 'Best', value: 'best' }];
+            quals.forEach((q, i) => {
+                const val = q.value != null ? String(q.value) : (q.url || '');
+                const isSelected = savedQuality ? (val === savedQuality) : (i === 0);
+                options += '<option value="' + escapeHtml(val) + '"' + (isSelected ? ' selected' : '') + '>' + escapeHtml(q.label) + '</option>';
+            });
+        } else if (video.qualities && video.qualities.length > 0) {
             video.qualities.forEach((q, i) => {
                 const isSelected = savedQuality ? (q.url === savedQuality) : (i === 0);
-                options += '<option value="' + q.url + '"' + (isSelected ? ' selected' : '') + '>' + q.label + '</option>';
+                options += '<option value="' + escapeHtml(q.url) + '"' + (isSelected ? ' selected' : '') + '>' + escapeHtml(q.label) + '</option>';
             });
         } else {
-            options = '<option value="' + video.url + '">Original</option>';
+            options = '<option value="' + escapeHtml(video.url) + '">Original</option>';
         }
 
         const hasThumbnail = video.thumbnail ? ' has-thumb' : '';
@@ -758,7 +767,6 @@ async function renderVideosOnly() {
             html += '<div class="video-thumb"><img class="thumb-proxied" data-thumb-url="' + escapeHtml(video.thumbnail) + '" alt=""></div>';
         }
 
-// ===== 変更後 =====
         html += '<div class="video-info">';
         html += '<div class="video-title">' + escapeHtml(video.title || 'Unknown Video') + (dlDone ? '<span class="downloaded-badge">DL済</span>' : '') + '</div>';
         html += '<div class="video-meta">';
@@ -837,10 +845,8 @@ function updateEmptyMessage() {
     }
 }
 
-// ===== 変更後 =====
 async function startDownload(video, url) {
     try {
-        // DL済みチェック
         const histCheck = await chrome.storage.local.get(['downloadHistory']);
         const hist = histCheck.downloadHistory || [];
         if (isDownloadedUrl(video.url, hist)) {
@@ -848,17 +854,42 @@ async function startDownload(video, url) {
         }
         const filename = (video.title || 'video').replace(/[<>:"/\\|?*]/g, '_').substring(0, 80);
 
-        // Check if YouTube
+        function removeDetectedByVideo() {
+            for (const [k, v] of detectedVideos) {
+                if (v.id === video.id) {
+                    detectedVideos.delete(k);
+                    selectedQualities.delete(k);
+                    return;
+                }
+            }
+        }
 
-        if (video.isYouTube) {
+        if (video.isYouTube || video.isYtDlp) {
+            let qualityValue = '1080';
+            if (url && video.qualities && video.qualities.length) {
+                const selectedQ = video.qualities.find(function (q) {
+                    return q.url === url || String(q.value) === String(url);
+                });
+                if (selectedQ) {
+                    if (selectedQ.value === 'best') {
+                        qualityValue = '4320';
+                    } else if (selectedQ.value != null && selectedQ.value !== '') {
+                        qualityValue = String(selectedQ.value);
+                    } else if (selectedQ.label) {
+                        var numMatch = selectedQ.label.match(/(\d+)/);
+                        if (numMatch) qualityValue = numMatch[1];
+                    }
+                }
+            }
+
             const body = {
-                url: video.url,
+                url: video.pageUrl || video.url,
                 filename: filename,
                 format_type: 'mp4',
-                quality: '1080',
+                quality: qualityValue,
                 thumbnail: true
             };
-            
+
             const res = await fetch(serverUrl + '/youtube/download', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -866,17 +897,14 @@ async function startDownload(video, url) {
             });
             const data = await res.json();
             if (data.task_id) {
-                const key = video.url;
-                detectedVideos.delete(key);
-                selectedQualities.delete(key);
+                removeDetectedByVideo();
                 chrome.runtime.sendMessage({ type: 'REMOVE_VIDEO_BY_URL', url: video.url });
                 await loadServerTasks();
                 renderVideosOnly();
             }
             return;
         }
-        
-        // Non-YouTube (HLS/DASH)
+
         const body = { url: url, filename: filename + '.mp4', format_type: 'mp4' };
         if (video.thumbnail) body.thumbnail_url = video.thumbnail;
 
@@ -894,9 +922,7 @@ async function startDownload(video, url) {
         });
         const data = await res.json();
         if (data.task_id) {
-            const key = video.url.replace(/\/(1080p|720p|480p|360p)\/video\.m3u8.*$/, '');
-            detectedVideos.delete(key);
-            selectedQualities.delete(key);
+            removeDetectedByVideo();
             chrome.runtime.sendMessage({ type: 'REMOVE_VIDEO_BY_URL', url: video.url });
             await loadServerTasks();
             renderVideosOnly();

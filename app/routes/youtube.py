@@ -1,4 +1,4 @@
-"""YouTube info and download."""
+"""yt-dlp info and download (YouTube, Dailymotion, etc.)."""
 
 from __future__ import annotations
 
@@ -18,6 +18,17 @@ from app.utils.validation import validate_http_url
 
 router = APIRouter(tags=["youtube"])
 logger = logging.getLogger(__name__)
+
+_RE_YOUTUBE = re.compile(
+    r"youtube\.com/watch\?|youtu\.be/|youtube\.com/shorts/",
+)
+
+
+def _detect_task_type(url: str) -> str:
+    """Return 'youtube' for YouTube URLs, 'yt-dlp' for all other /youtube/download targets."""
+    if _RE_YOUTUBE.search(url):
+        return "youtube"
+    return "yt-dlp"
 
 
 @router.get("/youtube/info")
@@ -40,12 +51,12 @@ async def youtube_info(url: str):
             "channel": info.get("channel", ""),
             "video_qualities": sorted(video_qualities, reverse=True),
             "audio_qualities": sorted(audio_qualities, reverse=True),
-            "is_youtube": True,
+            "is_youtube": _RE_YOUTUBE.search(url) is not None,
         }
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("youtube info: %s", e)
+        logger.exception("yt-dlp info: %s", e)
         raise HTTPException(status_code=400, detail=str(e))
 
 
@@ -53,6 +64,7 @@ async def youtube_info(url: str):
 async def youtube_download(request: YouTubeRequest):
     _url, _ = validate_http_url(request.url, block_private_ips=cfg.BLOCK_PRIVATE_IPS)
     task_id = new_task_id()
+    task_type = _detect_task_type(request.url)
 
     try:
         info = await youtube_service.fetch_youtube_json(request.url)
@@ -80,7 +92,7 @@ async def youtube_download(request: YouTubeRequest):
             status=TaskStatus.QUEUED,
             progress=0.0,
             message="Queue...",
-            type="youtube",
+            type=task_type,
             format=ft,
             quality=request.quality,
             thumbnail_url=thumbnail_url if request.thumbnail else None,
@@ -100,7 +112,7 @@ async def youtube_download(request: YouTubeRequest):
     )
     tm.active_downloads[task_id] = task
 
-    logger.info("YT queued: %s (%s, %s)", filename, ft, request.quality)
+    logger.info("yt-dlp queued [%s]: %s (%s, %s)", task_type, filename, ft, request.quality)
 
     return {
         "task_id": task_id,

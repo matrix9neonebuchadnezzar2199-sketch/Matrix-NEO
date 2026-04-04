@@ -25,6 +25,19 @@ function getCookieHeaderForUrl(pageUrl, callback) {
     }
 }
 
+/**
+ * Dailymotion watch-page URLs (short URL dai.ly included).
+ * Extend matchYtDlpSite when adding more yt-dlp-first-party sites.
+ */
+function matchYtDlpSite(url) {
+    if (!url) return null;
+    const m1 = url.match(/^https?:\/\/(?:[a-z]+\.)?dailymotion\.com\/video\/([a-zA-Z0-9]+)/);
+    if (m1) return { name: 'Dailymotion', videoId: m1[1] };
+    const m2 = url.match(/^https?:\/\/dai\.ly\/([a-zA-Z0-9]+)/);
+    if (m2) return { name: 'Dailymotion', videoId: m2[1] };
+    return null;
+}
+
 class VideoDetector {
     constructor() {
         this.detectedVideos = new Map();
@@ -52,6 +65,7 @@ class VideoDetector {
         chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
             if (changeInfo.status === 'complete' && tab.url) {
                 this.checkForYouTube(tabId, tab.url, tab.title);
+                this.checkForYtDlpSite(tabId, tab.url, tab.title);
                 this.scheduleScanProgressiveFromDom(tabId, tab.url);
             }
             if (changeInfo.status === 'loading' && changeInfo.url) {
@@ -101,6 +115,7 @@ class VideoDetector {
                         title: title ? title.replace(/^\(\d+\)\s*/, '').replace(/ - YouTube$/, '').trim() : 'YouTube Video',
                         thumbnail: `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`,
                         isYouTube: true,
+                        isYtDlp: true,
                         videoId: videoId,
                         tabId: tabId,
                         timestamp: Date.now(),
@@ -121,6 +136,61 @@ class VideoDetector {
                 return;
             }
         }
+    }
+
+    checkForYtDlpSite(tabId, url, title) {
+        if (/youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/shorts\//i.test(url)) {
+            return;
+        }
+        const site = matchYtDlpSite(url);
+        if (!site) return;
+
+        const videoId = site.videoId;
+        const key = `dailymotion_${videoId}`;
+        if (this.detectedVideos.has(key)) return;
+
+        let cleanTitle = title || 'Dailymotion Video';
+        cleanTitle = cleanTitle
+            .replace(/\s*[-–|]\s*動画\s*Dailymotion\s*$/i, '')
+            .replace(/\s*[-–|]\s*Dailymotion\s*$/i, '')
+            .replace(/\s*[-–|]\s*Video\s*Dailymotion\s*$/i, '')
+            .trim();
+        if (!cleanTitle) cleanTitle = 'Dailymotion Video';
+
+        const qualities = [
+            { label: 'Best', value: 'best' },
+            { label: '1080p', value: '1080' },
+            { label: '720p', value: '720' },
+            { label: '480p', value: '480' },
+        ];
+
+        const videoInfo = {
+            id: Date.now().toString() + Math.random().toString(36).substr(2, 9),
+            url: url,
+            pageUrl: url,
+            type: 'Dailymotion',
+            format: 'MP4',
+            qualities: qualities,
+            title: cleanTitle,
+            thumbnail: `https://www.dailymotion.com/thumbnail/video/${videoId}`,
+            isYouTube: false,
+            isYtDlp: true,
+            videoId: videoId,
+            tabId: tabId,
+            timestamp: Date.now(),
+            durationSec: null,
+        };
+
+        this.detectedVideos.set(key, videoInfo);
+        this.cleanupOldVideos();
+        this.updateBadge();
+
+        chrome.runtime.sendMessage({
+            type: 'VIDEO_DETECTED',
+            data: videoInfo
+        }).catch(() => {});
+
+        console.log('[MATRIX-M] Dailymotion detected:', cleanTitle, 'ID:', videoId);
     }
 
     getTabProcessedUrls(tabId) {
@@ -150,6 +220,7 @@ class VideoDetector {
     scheduleScanProgressiveFromDom(tabId, pageUrl) {
         if (!pageUrl || !/^https?:/i.test(pageUrl)) return;
         if (/youtube\.com|youtu\.be/i.test(pageUrl)) return;
+        if (matchYtDlpSite(pageUrl)) return;
         [600, 2500, 6000].forEach((ms) => {
             setTimeout(() => this.scanProgressiveVideoFromDom(tabId, pageUrl), ms);
         });
@@ -486,7 +557,8 @@ class VideoDetector {
                 pageUrl: pageUrl,
                 timestamp: Date.now(),
                 durationSec: durationSec != null && Number.isFinite(durationSec) ? durationSec : null,
-                isYouTube: false
+                isYouTube: false,
+                isYtDlp: false
             };
 
             const key = title !== 'Unknown Video' ? title.substring(0, 50) : url.split('?')[0];
