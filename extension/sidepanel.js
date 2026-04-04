@@ -11,7 +11,7 @@ let savedList = [];
 
 
 // === DL済み判定用ユーティリティ ===
-function extractVideoId(url) {
+function extractVideoIdFromUrl(url) {
   try {
     const u = new URL(url);
     // YouTube: ?v=xxx パラメータ
@@ -28,8 +28,8 @@ function extractVideoId(url) {
 }
 
 function isDownloadedUrl(videoUrl, history) {
-  const targetId = extractVideoId(videoUrl);
-  return history.some(item => extractVideoId(item.url) === targetId);
+  const targetId = extractVideoIdFromUrl(videoUrl);
+  return history.some(item => extractVideoIdFromUrl(item.url) === targetId);
 }
 
 function normalizeUrl(u) {
@@ -93,6 +93,8 @@ async function loadProxiedThumbnails() {
     const base = serverUrl.replace(/\/$/, '');
     const imgs = container.querySelectorAll('.videos-section img.thumb-proxied[data-thumb-url]');
     for (const img of imgs) {
+        if (img.src && img.src.startsWith('blob:')) continue;
+
         const thumbUrl = img.getAttribute('data-thumb-url');
         const card = img.closest('.video-card');
         if (!card || !thumbUrl) continue;
@@ -479,7 +481,7 @@ async function loadVpnDetails() {
     }
 }
 
-function extractVideoId(filename) {
+function extractVideoIdFromFilename(filename) {
     const patterns = [/FC2-PPV-(\d+)/i, /FC2PPV-(\d+)/i, /FC2-(\d+)/i, /([A-Z]+-\d+)/i, /(\d{6,})/];
     for (const pattern of patterns) {
         const match = filename.match(pattern);
@@ -490,15 +492,15 @@ function extractVideoId(filename) {
 
 function isAlreadySaved(title) {
     if (!title || savedList.length === 0) return false;
-    const videoId = extractVideoId(title);
+    const videoId = extractVideoIdFromFilename(title);
     if (!videoId) return false;
     const searchId = videoId.toLowerCase();
     return savedList.some(item => item.filename.toLowerCase().includes(searchId));
 }
 
 async function addToSavedList(filename) {
-    const videoId = extractVideoId(filename);
-    const exists = savedList.some(item => extractVideoId(item.filename) === videoId);
+    const videoId = extractVideoIdFromFilename(filename);
+    const exists = savedList.some(item => extractVideoIdFromFilename(item.filename) === videoId);
     if (!exists) {
         savedList.push({ filename: filename, date: new Date().toISOString() });
         await chrome.storage.local.set({ savedList });
@@ -529,8 +531,8 @@ async function importFromFolder() {
 
         let addedCount = 0;
         foundFiles.forEach(name => {
-            const videoId = extractVideoId(name);
-            const exists = savedList.some(item => extractVideoId(item.filename) === videoId);
+            const videoId = extractVideoIdFromFilename(name);
+            const exists = savedList.some(item => extractVideoIdFromFilename(item.filename) === videoId);
             if (!exists) {
                 savedList.push({ filename: name, date: new Date().toISOString() });
                 addedCount++;

@@ -203,8 +203,8 @@ class VideoDetector {
                         pageUrl: url,
                         type: 'YouTube',
                         format: 'MP4',
-                        qualities: FALLBACK_VIDEO_QUALITIES,
-                        audioQualities: FALLBACK_AUDIO_QUALITIES,
+                        qualities: [...FALLBACK_VIDEO_QUALITIES],
+                        audioQualities: [...FALLBACK_AUDIO_QUALITIES],
                         title: title ? title.replace(/^\(\d+\)\s*/, '').replace(/ - YouTube$/, '').trim() : 'YouTube Video',
                         thumbnail: `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`,
                         isYouTube: true,
@@ -264,7 +264,7 @@ class VideoDetector {
             pageUrl: url,
             type: 'Dailymotion',
             format: 'MP4',
-            qualities: FALLBACK_VIDEO_QUALITIES,
+            qualities: [...FALLBACK_VIDEO_QUALITIES],
             title: cleanTitle,
             thumbnail: `https://www.dailymotion.com/thumbnail/video/${videoId}`,
             isYouTube: false,
@@ -711,13 +711,8 @@ class VideoDetector {
             const repMatches = text.matchAll(/<Representation[^>]*width="(\d+)"[^>]*height="(\d+)"[^>]*/g);
             for (const match of repMatches) {
                 const height = parseInt(match[2]);
-                let label = 'Auto';
-                if (height >= 2160) label = '4K';
-                else if (height >= 1080) label = '1080p';
-                else if (height >= 720) label = '720p';
-                else if (height >= 480) label = '480p';
-                else label = '360p';
-                
+                const label = height >= 2160 ? '4K' : height + 'p';
+
                 if (!qualities.find(q => q.label === label)) {
                     qualities.push({ label, url: url });
                 }
@@ -781,11 +776,7 @@ class VideoDetector {
                         let label = 'Auto';
                         if (resMatch) {
                             const height = parseInt(resMatch[2]);
-                            if (height >= 2160) label = '4K';
-                            else if (height >= 1080) label = '1080p';
-                            else if (height >= 720) label = '720p';
-                            else if (height >= 480) label = '480p';
-                            else label = '360p';
+                            label = height >= 2160 ? '4K' : height + 'p';
                         }
 
                         qualities.push({ label, url: qualityUrl });
@@ -793,8 +784,14 @@ class VideoDetector {
                 }
             }
 
-            const order = ['4K', '1080p', '720p', '480p', '360p', 'Auto'];
-            qualities.sort((a, b) => order.indexOf(a.label) - order.indexOf(b.label));
+            qualities.sort((a, b) => {
+                const toNum = (lbl) => {
+                    if (lbl === '4K') return 2160;
+                    if (lbl === 'Auto') return -1;
+                    return parseInt(lbl, 10) || 0;
+                };
+                return toNum(b.label) - toNum(a.label);
+            });
 
             return qualities;
         } catch (error) {
