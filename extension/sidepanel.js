@@ -739,7 +739,10 @@ async function renderVideosOnly() {
 
         const savedQuality = selectedQualities.get(key);
 
+        // --- 品質 <select> 構築 ---
         let options = '';
+        const isResolvingQualities = (video.isYtDlp || video.isYouTube) && video._qualitiesResolved === false;
+
         if (video.isYtDlp || video.isYouTube) {
             const quals = video.qualities && video.qualities.length > 0
                 ? video.qualities
@@ -773,7 +776,7 @@ async function renderVideosOnly() {
         html += '<span class="duration-badge" title="長さ">' + (durLabel ? escapeHtml(durLabel) : '—') + '</span>';
         if (isSaved) html += '<span class="saved-tag">Saved</span>';
         if (video.thumbnail) html += '<span class="thumb-tag">Thumb</span>';
-        html += '<span>' + escapeHtml(video.type || '') + '</span><span>' + (video.qualities?.length || 1) + 'Q</span></div></div>';
+        html += '<span>' + escapeHtml(video.type || '') + '</span><span>' + (isResolvingQualities ? 'Loading...' : ((video.qualities?.length || 1) + 'Q')) + '</span></div></div>';
 
         html += '<div class="video-actions">';
         html += '<select class="quality-select">' + options + '</select>';

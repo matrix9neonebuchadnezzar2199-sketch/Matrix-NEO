@@ -25,6 +25,70 @@ function getCookieHeaderForUrl(pageUrl, callback) {
     }
 }
 
+/** Return saved server URL (default http://localhost:6850). */
+async function getServerUrl() {
+    try {
+        const result = await chrome.storage.local.get(['serverUrl']);
+        return result.serverUrl || 'http://localhost:6850';
+    } catch {
+        return 'http://localhost:6850';
+    }
+}
+
+/**
+ * yt-dlp サイトの品質をサーバー /youtube/info 経由で動的取得。
+ */
+async function fetchYtDlpQualities(url) {
+    try {
+        const base = (await getServerUrl()).replace(/\/$/, '');
+        const controller = new AbortController();
+        const tid = setTimeout(() => controller.abort(), 15000);
+        let res;
+        try {
+            res = await fetch(
+                base + '/youtube/info?url=' + encodeURIComponent(url),
+                { signal: controller.signal }
+            );
+        } finally {
+            clearTimeout(tid);
+        }
+        if (!res.ok) return null;
+        const info = await res.json();
+
+        const vq = info.video_qualities || [];
+        const qualities = [{ label: 'Best', value: 'best' }];
+        for (const h of vq) {
+            const n = parseInt(h, 10);
+            if (!n || n <= 0) continue;
+            const label = n >= 2160 ? '4K' : n + 'p';
+            if (!qualities.some((q) => q.value === String(n))) {
+                qualities.push({ label, value: String(n) });
+            }
+        }
+
+        const aq = info.audio_qualities || [];
+        const audioQualities = [];
+        for (const abr of aq) {
+            const n = parseInt(abr, 10);
+            if (!n || n <= 0) continue;
+            if (!audioQualities.some((q) => q.value === String(n))) {
+                audioQualities.push({ label: n + 'kbps', value: String(n) });
+            }
+        }
+
+        return {
+            qualities,
+            audioQualities,
+            duration: info.duration || null,
+            title: info.title || null,
+            thumbnail: info.thumbnail || null,
+        };
+    } catch (e) {
+        console.log('[MATRIX-M] fetchYtDlpQualities failed:', e.message);
+        return null;
+    }
+}
+
 /**
  * Dailymotion watch-page URLs (short URL dai.ly included).
  * Extend matchYtDlpSite when adding more yt-dlp-first-party sites.
@@ -37,6 +101,20 @@ function matchYtDlpSite(url) {
     if (m2) return { name: 'Dailymotion', videoId: m2[1] };
     return null;
 }
+
+/** Hardcoded qualities before server responds (fallback). */
+const FALLBACK_VIDEO_QUALITIES = [
+    { label: 'Best', value: 'best' },
+    { label: '1080p', value: '1080' },
+    { label: '720p', value: '720' },
+    { label: '480p', value: '480' },
+];
+const FALLBACK_AUDIO_QUALITIES = [
+    { label: '320kbps', value: '320' },
+    { label: '256kbps', value: '256' },
+    { label: '192kbps', value: '192' },
+    { label: '128kbps', value: '128' },
+];
 
 class VideoDetector {
     constructor() {
@@ -80,6 +158,31 @@ class VideoDetector {
         console.log('[MATRIX-M] Background initialized');
     }
 
+    /**
+     * Replace qualities on an existing entry from server /youtube/info and notify side panel.
+     */
+    _updateVideoQualities(key, qualities, audioQualities, extraFields) {
+        const existing = this.detectedVideos.get(key);
+        if (!existing) return;
+
+        existing.qualities = qualities;
+        if (audioQualities && audioQualities.length > 0) {
+            existing.audioQualities = audioQualities;
+        }
+        if (extraFields) {
+            if (extraFields.duration != null) existing.durationSec = extraFields.duration;
+        }
+        existing._qualitiesResolved = true;
+        this.detectedVideos.set(key, existing);
+
+        chrome.runtime.sendMessage({
+            type: 'VIDEO_DETECTED',
+            data: existing
+        }).catch(() => {});
+
+        console.log('[MATRIX-M] Qualities updated for', key, '→', qualities.map((q) => q.label).join(', '));
+    }
+
     checkForYouTube(tabId, url, title) {
         const youtubePatterns = [
             /youtube\.com\/watch\?v=([a-zA-Z0-9_-]+)/,
@@ -92,7 +195,7 @@ class VideoDetector {
             if (match) {
                 const videoId = match[1];
                 const key = `youtube_${videoId}`;
-                
+
                 if (!this.detectedVideos.has(key)) {
                     const videoInfo = {
                         id: Date.now().toString() + Math.random().toString(36).substr(2, 9),
@@ -100,18 +203,8 @@ class VideoDetector {
                         pageUrl: url,
                         type: 'YouTube',
                         format: 'MP4',
-                        qualities: [
-                            { label: 'Best', value: 'best' },
-                            { label: '1080p', value: '1080' },
-                            { label: '720p', value: '720' },
-                            { label: '480p', value: '480' }
-                        ],
-                        audioQualities: [
-                            { label: '320kbps', value: '320' },
-                            { label: '256kbps', value: '256' },
-                            { label: '192kbps', value: '192' },
-                            { label: '128kbps', value: '128' }
-                        ],
+                        qualities: FALLBACK_VIDEO_QUALITIES,
+                        audioQualities: FALLBACK_AUDIO_QUALITIES,
                         title: title ? title.replace(/^\(\d+\)\s*/, '').replace(/ - YouTube$/, '').trim() : 'YouTube Video',
                         thumbnail: `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`,
                         isYouTube: true,
@@ -119,7 +212,8 @@ class VideoDetector {
                         videoId: videoId,
                         tabId: tabId,
                         timestamp: Date.now(),
-                        durationSec: null
+                        durationSec: null,
+                        _qualitiesResolved: false,
                     };
 
                     this.detectedVideos.set(key, videoInfo);
@@ -132,6 +226,12 @@ class VideoDetector {
                     }).catch(() => {});
 
                     console.log('[MATRIX-M] YouTube detected:', title, 'ID:', videoId);
+
+                    fetchYtDlpQualities(url).then((result) => {
+                        if (result && result.qualities.length > 1) {
+                            this._updateVideoQualities(key, result.qualities, result.audioQualities, result);
+                        }
+                    });
                 }
                 return;
             }
@@ -152,17 +252,11 @@ class VideoDetector {
         let cleanTitle = title || 'Dailymotion Video';
         cleanTitle = cleanTitle
             .replace(/\s*[-–|]\s*動画\s*Dailymotion\s*$/i, '')
-            .replace(/\s*[-–|]\s*Dailymotion\s*$/i, '')
-            .replace(/\s*[-–|]\s*Video\s*Dailymotion\s*$/i, '')
+            .replace(/\s*[-|]\s*\s*Dailymotion\s*$/i, '')
+            .replace(/\s*[-|]\s*Dailymotion\s*$/i, '')
+            .replace(/\s*[-|]\s*Video\s*Dailymotion\s*$/i, '')
             .trim();
         if (!cleanTitle) cleanTitle = 'Dailymotion Video';
-
-        const qualities = [
-            { label: 'Best', value: 'best' },
-            { label: '1080p', value: '1080' },
-            { label: '720p', value: '720' },
-            { label: '480p', value: '480' },
-        ];
 
         const videoInfo = {
             id: Date.now().toString() + Math.random().toString(36).substr(2, 9),
@@ -170,7 +264,7 @@ class VideoDetector {
             pageUrl: url,
             type: 'Dailymotion',
             format: 'MP4',
-            qualities: qualities,
+            qualities: FALLBACK_VIDEO_QUALITIES,
             title: cleanTitle,
             thumbnail: `https://www.dailymotion.com/thumbnail/video/${videoId}`,
             isYouTube: false,
@@ -179,6 +273,7 @@ class VideoDetector {
             tabId: tabId,
             timestamp: Date.now(),
             durationSec: null,
+            _qualitiesResolved: false,
         };
 
         this.detectedVideos.set(key, videoInfo);
@@ -191,6 +286,12 @@ class VideoDetector {
         }).catch(() => {});
 
         console.log('[MATRIX-M] Dailymotion detected:', cleanTitle, 'ID:', videoId);
+
+        fetchYtDlpQualities(url).then((result) => {
+            if (result && result.qualities.length > 1) {
+                this._updateVideoQualities(key, result.qualities, result.audioQualities, result);
+            }
+        });
     }
 
     getTabProcessedUrls(tabId) {
