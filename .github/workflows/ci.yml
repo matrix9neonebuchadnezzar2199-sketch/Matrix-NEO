@@ -22,5 +22,6 @@ jobs:
         run: |
           pip install -r requirements-dev.txt
           pip list
+          python -c "from app.main import app; print('import OK')"
       - name: Pytest
-        run: pytest -v --tb=short -p no:asyncio
+        run: python -m pytest -v --tb=long
