@@ -19,6 +19,8 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install
-        run: pip install -r requirements-dev.txt
+        run: |
+          pip install -r requirements-dev.txt
+          pip list
       - name: Pytest
-        run: pytest -v --tb=short
+        run: pytest -v --tb=short -p no:asyncio
