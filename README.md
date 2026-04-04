@@ -1,90 +1,147 @@
-# MATRIX-NEO（PyInstaller 配布用）
+# MATRIX-NEO
 
-このフォルダは親プロジェクト MATRIX-M とは独立して運用します。  
-サーバー実装は `app/` パッケージに分割され、ルートの `main.py` は `from app.main import app` 互換用の薄いラッパーです。
+**自分の PC 上で動くダウンロード用サーバー**です。ブラウザ（Chrome 拡張）から URL を送ると、裏で **HLS（`.m3u8`）・直リンクの動画・YouTube** などを取得し、`output` フォルダに保存します。
 
-## フォルダ構成（想定）
+外部ツール（`N_m3u8DL-RE` / `yt-dlp` / `ffmpeg` など）を起動して処理する **FastAPI + uvicorn** の単一プロセス構成です。
 
-| パス | 説明 |
+---
+
+## 全体の流れ（ざっくり）
+
+```mermaid
+flowchart LR
+    subgraph pc["あなたの PC"]
+        ext["Chrome 拡張"]
+        srv["MATRIX-NEO サーバー\n127.0.0.1:6850"]
+        out[("output フォルダ")]
+        ext -->|"HTTP で URL・指示"| srv
+        srv -->|"完成ファイル"| out
+    end
+    srv --> tools["N_m3u8DL-RE / yt-dlp / ffmpeg"]
+    tools --> srv
+```
+
+| 役割 | 説明 |
 |------|------|
-| `app/` | FastAPI アプリ（`routes/`・`services/`・`config.py` など） |
-| `main.py` | 後方互換: `app.main.app` の再エクスポート |
-| `run_server.py` | uvicorn 起動（PyInstaller のエントリ） |
-| `matrix-neo.spec` | PyInstaller 定義 |
-| `build-windows.bat` | Windows で exe ビルド |
-| `requirements.txt` | 実行に必要な Python パッケージ |
-| `tools/` | N_m3u8DL-RE.exe, yt-dlp.exe, ffmpeg.exe, AtomicParsley.exe |
-| `output/` | ダウンロード保存先 |
-| `temp/` | 一時ファイル |
-| `extension/` | Chrome 拡張（パッケージ化されていない拡張機能で読み込み） |
+| **Chrome 拡張** | ページの URL や設定をサーバーへ送る |
+| **サーバー** | キュー管理・進捗・外部ツールの起動 |
+| **tools** | 実際のダウンロード・結合・変換（手動で `tools` に exe を置く） |
+| **output** | 完成した動画・音声の保存先 |
 
-## Python のバージョン
+---
 
-`pip` / `pydantic-core` で Rust ビルドエラーになる場合は、**Python 3.12 または 3.13** で venv を作り直してください。  
-（3.14 はパッケージによってはまだホイール未対応のことがあります。）
+## 始める前に用意するもの
 
-## 開発時の起動（Docker なし）
+| 項目 | 内容 |
+|------|------|
+| OS | 主に **Windows**（`build-windows.bat` は Windows 向け） |
+| Python | **3.12 または 3.13** 推奨（3.14 は一部パッケージで未対応のことがあります） |
+| 外部ツール | `tools` フォルダに **`N_m3u8DL-RE`・`yt-dlp`・`ffmpeg`** など（配布 ZIP 同梱の想定） |
+| ブラウザ | **Google Chrome**（拡張を読み込むため） |
+
+---
+
+## 初めて使う人向け：セットアップ手順
+
+### 手順 1：Python の仮想環境を作る
+
+コマンドプロンプトまたは PowerShell で、このリポジトリのフォルダに移動します。
 
 ```bat
-cd 本フォルダ
+cd C:\path\to\MATRIX-NEO
 python -m venv .venv
 .venv\Scripts\activate
-pip install -U pip
+python -m pip install -U pip
 pip install -r requirements.txt
 ```
 
-`tools\` に上記 exe を配置してから:
+> **うまくいかないとき**  
+> `python` が見つからない → [python.org](https://www.python.org/) から Python 3.12/3.13 をインストールし、インストール時に **「Add Python to PATH」** にチェックを入れてください。
+
+### 手順 2：`tools` に exe を置く
+
+`tools` フォルダに、次のような実行ファイルを配置します（名前・入手元はプロジェクトの配布物・ドキュメントに合わせてください）。
+
+| 置くもの（例） | 役割のイメージ |
+|----------------|----------------|
+| `N_m3u8DL-RE`（または同名 exe） | HLS（`.m3u8`）の取得 |
+| `yt-dlp` | YouTube など |
+| `ffmpeg` | 変換・結合・コンテナ処理 |
+
+パスは `app/utils/paths.py` の解決ルールに従います。**ここが空だとダウンロード処理が動きません。**
+
+### 手順 3：サーバーを起動する
+
+仮想環境を有効にしたまま：
 
 ```bat
 python run_server.py
 ```
 
-→ <http://127.0.0.1:6850/health>（ポートは環境変数 `MATRIX_NEO_PORT` で変更可、既定 **6850**）
+次の URL をブラウザで開き、**`"status":"ok"` のような正常応答**が返れば起動できています。
 
-## exe のビルド（Windows・任意）
+| 確認用 URL | 意味 |
+|------------|------|
+| http://127.0.0.1:6850/health | サーバーが生きているか |
 
-普段の開発は上記の `python run_server.py` のみで足ります。  
-配布用に単一 exe が必要なときだけ `build-windows.bat` を実行し、`dist\MATRIX-NEO-Server\MATRIX-NEO-Server.exe` を生成します。
+ポート **6850** は環境変数 `MATRIX_NEO_PORT` で変更できます。
 
-## 配布用 ZIP の作り方
+### 手順 4：Chrome 拡張を読み込む
 
-`dist\MATRIX-NEO-Server\` フォルダ全体をベースに、同じ階層に次をコピー:
+1. Chrome で `chrome://extensions` を開く  
+2. **デベロッパーモード**をオン  
+3. **パッケージ化されていない拡張機能を読み込む**で、このリポジトリの **`extension` フォルダ**を指定  
 
-- `tools\`（各 exe）
-- `extension\`（拡張一式）
-- `output\`（空で可）
-- `temp\`（空で可）
+拡張の設定画面で、**サーバー URL が `http://127.0.0.1:6850`（または変更したポート）** になっているか確認してください。
 
-ユーザーは `MATRIX-NEO-Server.exe` をダブルクリックで起動し、Chrome で `extension` フォルダを読み込みます。
+### 手順 5：ダウンロードを試す
 
-## 注意
+拡張から動画ページで実行すると、サーバーが処理し、**`output` フォルダ**にファイルができます。  
+進捗は拡張の UI や、必要なら `GET /tasks` などの API で確認できます。
 
-- 初回のみ Windows ファイアウォールの許可ダイアログが出ることがあります。
-- PyInstaller の exe はウイルス対策ソフトに誤検知される場合があります。
-- ポートは **6850**（`run_server.py` と `app.config.PORT`）。拡張のサーバー URL も同じポートに合わせてください。
+---
 
-### 主な環境変数
+## フォルダ構成（よく触るところ）
 
-| 変数 | 既定 | 説明 |
-|------|------|------|
-| `MATRIX_NEO_PORT` | `6850` | 待受ポート |
-| `MATRIX_NEO_LOG_LEVEL` | `INFO` | ログレベル |
-| `MATRIX_NEO_BLOCK_PRIVATE_IPS` | `0` | `1` でプライベート IP 向け URL を拒否（SSRF 緩和・LAN 再生は阻害）。**リンクローカル / ULA / 169.254.0.0/16（メタデータ等）はフラグに関係なく常に拒否** |
-| `MATRIX_NEO_TASK_TTL_HOURS` | `24` | 完了/エラー/**停止**タスクをメモリから削除するまでの時間 |
-| `MATRIX_NEO_PROXY_IMAGE_RATE_LIMIT` | `30` | `/proxy-image` のクライアントあたり許可リクエスト数（ウィンドウ内） |
-| `MATRIX_NEO_PROXY_IMAGE_RATE_WINDOW_SEC` | `60` | 上記のウィンドウ秒 |
-| `MATRIX_NEO_VPN_KEYWORDS` | （既定リスト） | `/vpn-status` の ISP 名判定用キーワード（カンマ区切り） |
-| `MAX_CONCURRENT_DOWNLOADS` | `10` | 同時ダウンロード数 |
+| パス | 何が入るか |
+|------|------------|
+| `app/` | サーバー本体（API・設定・処理ロジック） |
+| `run_server.py` | 起動スクリプト（`uvicorn` で `127.0.0.1` にバインド） |
+| `tools/` | 外部コマンド用 exe（**自分で配置**） |
+| `output/` | **ダウンロード結果の保存先** |
+| `temp/` | 一時ファイル |
+| `extension/` | Chrome 拡張（ソースをそのまま読み込み） |
+| `.env` | 任意。環境変数を書く（`.env.example` をコピーして編集） |
 
-変数の一覧例はリポジトリ直下の **`.env.example`** を参照してください。機密やローカル上書き用の **`.env`** は Git に含めません。
+ルートの `main.py` は後方互換用の薄いラッパーです。配布用 **exe** を作るときは `matrix-neo.spec` と `build-windows.bat` を使います。
 
-## トラブル（429 / 中盤で 0.00Bps → Force Exit）
+---
 
-配信側のレート制限やセグメント URL の期限で、止まって N_m3u8DL が諦めることがあります。
+## よく使う環境変数
 
-既定（最大速度寄り）: `thread=32`・`retry=50`・HTTP 120s・`-mt ON`・`max_speed` なし（無制限）・Chrome 風 UA 等。
+`.env` に書くか、PowerShell では `$env:変数名 = "値"` で設定します。一覧の雛形は **`.env.example`** にあります。
 
-速すぎて 429 が出る場合は帯域・並列を下げる:
+| 変数 | 既定 | 意味（ざっくり） |
+|------|------|------------------|
+| `MATRIX_NEO_PORT` | `6850` | 待ち受けポート |
+| `MATRIX_NEO_LOG_LEVEL` | `INFO` | ログの詳しさ |
+| `MATRIX_NEO_BLOCK_PRIVATE_IPS` | `0` | `1` だとプライベート IP の URL を拒否（LAN 再生などは壊れやすい） |
+| `MAX_CONCURRENT_DOWNLOADS` | `10` | 同時に走らせるダウンロード数 |
+| `MATRIX_NEO_TASK_TTL_HOURS` | `24` | 完了・エラー・停止タスクをメモリから消すまでの時間 |
+
+HLS の細かい調整（スレッド数・リトライ・速度上限など）は `.env.example` の `MATRIX_NEO_M3U8_*` を参照してください。
+
+---
+
+## トラブル時のヒント
+
+| 症状 | 試すこと |
+|------|----------|
+| ブラウザから繋がらない | サーバーを起動したか、`127.0.0.1` と **ポート番号**が拡張と一致しているか |
+| ダウンロードが始まらない | `tools` に必要な exe があるか、`/health` は成功するか |
+| 429 や途中で止まる（0.00Bps など） | 配信側の制限の可能性。スレッドや速度を下げる（例：`MATRIX_NEO_M3U8_THREADS`、`MATRIX_NEO_M3U8_MAX_SPEED`） |
+
+詳しい調整例は従来どおり、環境変数で **スレッド・リトライ・最大速度・`-mt` の有無** を変えて試せます。
 
 ```powershell
 $env:MATRIX_NEO_M3U8_THREADS = "8"
@@ -93,7 +150,32 @@ $env:MATRIX_NEO_M3U8_MAX_SPEED = "8M"
 python run_server.py
 ```
 
-さらに安定優先なら `THREADS=1`、`RETRY` を上げる（例: 80）。  
-`MAX_SPEED` は全体の速度上限（空なら無制限）。ブラウザと同じ UA が必要な場合は既定のまま。
+- 初回起動時、Windows ファイアウォールの許可ダイアログが出ることがあります。  
+- PyInstaller で作った exe はウイルス対策に誤検知されることがあります。
 
-無効化: `$env:MATRIX_NEO_M3U8_BROWSER_HEADERS = "0"`
+---
+
+## Windows で exe をビルドする（任意）
+
+普段の開発は `python run_server.py` だけで構いません。単一 exe が必要なときだけ：
+
+1. `build-windows.bat` を実行  
+2. `dist\MATRIX-NEO-Server\MATRIX-NEO-Server.exe` が生成される  
+
+配布用にフォルダをまとめるときは、`dist` の出力に加えて **`tools`・`extension`・空の `output` / `temp`** などを同梱する形が想定されています。
+
+---
+
+## 開発者向け：テスト
+
+```bat
+.venv\Scripts\activate
+pip install -r requirements-dev.txt
+python -m pytest -v
+```
+
+---
+
+## ライセンス・注意
+
+本 README の構成・表記は読みやすさ優先で整理しています。利用条件やライセンスはリポジトリのライセンスファイルに従ってください。
