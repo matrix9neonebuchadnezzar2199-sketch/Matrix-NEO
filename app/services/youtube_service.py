@@ -30,6 +30,20 @@ from app.utils.paths import YTDLP
 
 logger = logging.getLogger(__name__)
 
+_RE_DIGITS_ONLY = re.compile(r"^\d+$")
+
+
+def _sanitize_yt_quality(quality: str | None, format_type: str) -> str:
+    """Clamp height (mp4) or audio bitrate (mp3) to safe numeric strings for yt-dlp -f."""
+    default = "192" if format_type == "mp3" else "1080"
+    s = (quality or default).strip()
+    if not _RE_DIGITS_ONLY.fullmatch(s):
+        return default
+    n = int(s)
+    if format_type == "mp3":
+        return str(max(64, min(320, n)))
+    return str(max(144, min(4320, n)))
+
 
 class _LRUCache:
     def __init__(self, maxsize: int, ttl: float):
@@ -95,6 +109,7 @@ async def run_youtube_download(
     thumbnail_url: Optional[str] = None,
 ) -> None:
     _ = thumbnail_url
+    quality = _sanitize_yt_quality(quality, format_type)
     async with tm.semaphore:
         process: Optional[asyncio.subprocess.Process] = None
         try:

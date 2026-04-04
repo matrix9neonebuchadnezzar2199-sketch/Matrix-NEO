@@ -41,12 +41,11 @@ def url_with_pinned_ip(original_url: str, resolved_ips: list[str]) -> tuple[str,
     if port is None:
         port = 443 if p.scheme == "https" else 80
     path = p.path or "/"
-    if p.query:
-        path += "?" + p.query
 
     if isinstance(ia, ipaddress.IPv6Address):
         netloc = f"[{ip}]:{port}"
     else:
         netloc = f"{ip}:{port}"
-    new_u = urlunparse((p.scheme, netloc, path, "", "", ""))
+    # Preserve params, query, fragment (do not fold query into path).
+    new_u = urlunparse((p.scheme, netloc, path, p.params, p.query, p.fragment))
     return new_u, hostname

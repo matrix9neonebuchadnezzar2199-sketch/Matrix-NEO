@@ -27,9 +27,7 @@ async def download(request: DownloadRequest):
     )
 
     task_id = new_task_id()
-    filename = request.filename or f"video_{task_id}.mp4"
-    if not filename.endswith(".mp4"):
-        filename += ".mp4"
+    filename = request.filename or f"video_{task_id}"
     filename = sanitize_filename_for_windows(filename)
 
     if request.thumbnail_url:

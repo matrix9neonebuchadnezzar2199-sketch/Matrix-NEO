@@ -19,10 +19,21 @@ _limiter = RateLimiter(
 )
 
 
+def _client_rate_limit_key(request: Request) -> str:
+    """Prefer X-Forwarded-For client when behind a proxy; else direct socket host."""
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        first = fwd.split(",")[0].strip()
+        if first:
+            return first
+    if request.client and request.client.host:
+        return request.client.host
+    return "unknown"
+
+
 @router.post("/proxy-image")
 async def proxy_image(request: Request, req: ProxyImageRequest):
-    client_host = request.client.host if request.client else "unknown"
-    if not _limiter.is_allowed(client_host):
+    if not _limiter.is_allowed(_client_rate_limit_key(request)):
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
     _url, _ = validate_http_url(req.url.strip(), block_private_ips=cfg.BLOCK_PRIVATE_IPS)
