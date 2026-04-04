@@ -2,19 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import shutil
 import sys
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, Optional
 
-import asyncio
 import httpx
 
 from app import config as cfg
-from app import state
+from app.constants import PROGRESS_THUMB_DL, PROGRESS_THUMB_EMBED
+from app.models import TaskStatus
 from app.services import http_client
+from app.state import tm
 from app.utils.file_ops import replace_or_move_overwrite
 from app.utils.filename import is_ascii_basename
 from app.utils.process import stderr_tail, subprocess_exit_code
@@ -123,18 +126,21 @@ async def download_thumbnail(
     return False
 
 
-async def embed_thumbnail_ffmpeg(
-    video_path: str, thumb_path: str, temp_output: Optional[str] = None
+async def _ffmpeg_embed(
+    video_path: Path, thumb_path: Path, temp_output: Optional[Path]
 ) -> bool:
-    out_path = temp_output if temp_output else (video_path + ".thumb.mp4")
+    out_path = temp_output if temp_output is not None else Path(str(video_path) + ".thumb.mp4")
+    out_str = str(out_path)
+    vp = str(video_path)
+    tp = str(thumb_path)
     try:
         cmd = [
             FFMPEG,
             "-y",
             "-i",
-            video_path,
+            vp,
             "-i",
-            thumb_path,
+            tp,
             "-map",
             "0:v:0",
             "-map",
@@ -153,21 +159,21 @@ async def embed_thumbnail_ffmpeg(
             "attached_pic",
             "-movflags",
             "+faststart",
-            out_path,
+            out_str,
         ]
         process = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
         out, err = await process.communicate()
-        if process.returncode == 0 and os.path.exists(out_path):
-            replace_or_move_overwrite(out_path, video_path)
+        if process.returncode == 0 and os.path.exists(out_str):
+            replace_or_move_overwrite(out_str, vp)
             return True
         if err or out:
             rc = subprocess_exit_code(process.returncode)
             logger.warning("ffmpeg embed exit=%s %s", rc, stderr_tail(err or out))
-        if os.path.exists(out_path):
+        if os.path.exists(out_str):
             try:
-                os.remove(out_path)
+                os.remove(out_str)
             except OSError:
                 pass
     except Exception as e:
@@ -175,58 +181,39 @@ async def embed_thumbnail_ffmpeg(
     return False
 
 
-async def embed_thumbnail_ffmpeg_with_temp_out(
-    video_path: str, thumb_path: str, task_id: str
-) -> bool:
-    out_path = os.path.join(cfg.TEMP_DIR, f"{task_id}_thumb_out.mp4")
-    return await embed_thumbnail_ffmpeg(video_path, thumb_path, temp_output=out_path)
+def _build_strategies(
+    video_path: Path, task_id: str
+) -> list[tuple[str, Path, Optional[Path]]]:
+    temp_out: Optional[Path] = cfg.TEMP_DIR / f"{task_id}_thumb_out.mp4"
+    if sys.platform == "win32" and not is_ascii_basename(str(video_path)):
+        work = cfg.TEMP_DIR / f"{task_id}_embed.mp4"
+        shutil.copy2(video_path, work)
+        return [
+            ("win-ascii-temp", work, temp_out),
+            ("win-ascii-direct", work, None),
+        ]
+    return [
+        ("temp-output", video_path, temp_out),
+        ("direct", video_path, None),
+    ]
 
 
-async def embed_thumbnail_atomic(
-    video_path: str, thumb_path: str, task_id: Optional[str] = None
-) -> bool:
-    if not os.path.exists(thumb_path) or not os.path.exists(video_path):
+async def embed_thumbnail(video_path: Path, thumb_path: Path, task_id: str) -> bool:
+    """Try embedding strategies in order, return on first success."""
+    if not thumb_path.is_file() or not video_path.is_file():
         return False
     try:
-        if task_id:
-            return await embed_thumbnail_ffmpeg_with_temp_out(video_path, thumb_path, task_id)
-        return await embed_thumbnail_ffmpeg(video_path, thumb_path)
-    except Exception as e:
-        logger.exception("embed_thumbnail_atomic primary: %s", e)
-    # Single fallback without re-entering the same failing path twice
-    try:
-        if task_id:
-            return await embed_thumbnail_ffmpeg(video_path, thumb_path)
-        return False
-    except Exception as e:
-        logger.exception("embed_thumbnail_atomic fallback: %s", e)
-        return False
-
-
-async def embed_thumbnail_via_ascii_workdir(
-    video_path: str, thumb_path: str, task_id: str
-) -> bool:
-    work_video = os.path.join(cfg.TEMP_DIR, f"{task_id}_embed.mp4")
-    try:
-        shutil.copy2(video_path, work_video)
+        strategies = _build_strategies(video_path, task_id)
     except OSError as e:
-        logger.warning("copy to ASCII temp failed: %s", e)
-        return await embed_thumbnail_atomic(video_path, thumb_path, task_id=task_id)
-
-    ok = await embed_thumbnail_atomic(work_video, thumb_path, task_id=task_id)
-    if ok:
-        try:
-            replace_or_move_overwrite(work_video, video_path)
-        except OSError as e:
-            logger.error("replace result failed: %s", e)
-            return False
-        return True
-
-    try:
-        if os.path.exists(work_video):
-            os.remove(work_video)
-    except OSError:
-        pass
+        logger.warning("embed strategies: %s", e)
+        return False
+    for label, video_for_embed, temp_output in strategies:
+        ok = await _ffmpeg_embed(video_for_embed, thumb_path, temp_output)
+        if ok:
+            if video_for_embed != video_path:
+                replace_or_move_overwrite(str(video_for_embed), str(video_path))
+            return True
+        logger.warning("embed strategy '%s' failed", label)
     return False
 
 
@@ -234,21 +221,25 @@ async def thumbnail_worker() -> None:
     while True:
         job = None
         try:
-            if state.thumb_queue is None:
+            if tm.thumb_queue is None:
                 await asyncio.sleep(0.5)
                 continue
-            job = await state.thumb_queue.get()
+            job = await tm.thumb_queue.get()
             video_path = job["video_path"]
             thumb_url = job["thumb_url"]
             task_id = job["task_id"]
 
-            if task_id in state.tasks:
-                state.tasks[task_id]["status"] = "thumbnail"
-                state.tasks[task_id]["progress"] = 92
-                state.tasks[task_id]["message"] = "Downloading thumbnail..."
+            if tm.exists(task_id):
+                await tm.update(
+                    task_id,
+                    status=TaskStatus.THUMBNAIL,
+                    progress=float(PROGRESS_THUMB_DL),
+                    message="Downloading thumbnail...",
+                )
 
             logger.info("THUMB-WORKER processing: %s", os.path.basename(video_path))
-            thumb_path = os.path.join(cfg.TEMP_DIR, f"{task_id}_thumb.jpg")
+            thumb_path = str(cfg.TEMP_DIR / f"{task_id}_thumb.jpg")
+            vpath = Path(video_path)
 
             if await download_thumbnail(
                 thumb_url,
@@ -261,41 +252,44 @@ async def thumbnail_worker() -> None:
                         "thumbnail not JPEG/PNG and conversion failed; embed may fail (%s)",
                         os.path.basename(thumb_path),
                     )
-                if task_id in state.tasks:
-                    state.tasks[task_id]["progress"] = 95
-                    state.tasks[task_id]["message"] = "Embedding thumbnail..."
+                if tm.exists(task_id):
+                    await tm.update(
+                        task_id,
+                        progress=float(PROGRESS_THUMB_EMBED),
+                        message="Embedding thumbnail...",
+                    )
 
                 start = datetime.now()
-                if sys.platform == "win32" and not is_ascii_basename(video_path):
-                    success = await embed_thumbnail_via_ascii_workdir(
-                        video_path, thumb_path, task_id
-                    )
-                else:
-                    success = await embed_thumbnail_atomic(
-                        video_path, thumb_path, task_id=task_id
-                    )
+                success = await embed_thumbnail(vpath, Path(thumb_path), task_id)
                 elapsed = (datetime.now() - start).total_seconds()
 
                 if success:
                     logger.info(
                         "THUMB-WORKER done: %s (%.1fs)", os.path.basename(video_path), elapsed
                     )
-                    if task_id in state.tasks:
-                        state.tasks[task_id]["status"] = "completed"
-                        state.tasks[task_id]["progress"] = 100
-                        fs = state.tasks[task_id].get("file_size", 0)
+                    if tm.exists(task_id):
+                        t = tm.get(task_id)
+                        fs = t.file_size if t else 0
                         size_mb = fs / (1024 * 1024) if fs else 0
-                        state.tasks[task_id]["message"] = f"Done! {size_mb:.1f}MB [+thumb]"
-                        state.tasks[task_id]["completed_at"] = datetime.now().isoformat()
+                        await tm.update(
+                            task_id,
+                            status=TaskStatus.COMPLETED,
+                            progress=100.0,
+                            message=f"Done! {size_mb:.1f}MB [+thumb]",
+                            completed_at=datetime.now().isoformat(),
+                        )
                 else:
                     logger.warning("THUMB-WORKER failed embed: %s", os.path.basename(video_path))
-                    if task_id in state.tasks:
-                        state.tasks[task_id]["status"] = "completed"
-                        state.tasks[task_id]["progress"] = 100
-                        state.tasks[task_id]["message"] = (
-                            state.tasks[task_id].get("message", "Done!") + " [no thumb]"
+                    if tm.exists(task_id):
+                        t = tm.get(task_id)
+                        prev = t.message if t else "Done!"
+                        await tm.update(
+                            task_id,
+                            status=TaskStatus.COMPLETED,
+                            progress=100.0,
+                            message=f"{prev} [no thumb]",
+                            completed_at=datetime.now().isoformat(),
                         )
-                        state.tasks[task_id]["completed_at"] = datetime.now().isoformat()
 
                 try:
                     if os.path.exists(thumb_path):
@@ -306,25 +300,31 @@ async def thumbnail_worker() -> None:
                 logger.warning(
                     "THUMB-WORKER failed download thumbnail: %s", os.path.basename(video_path)
                 )
-                if task_id in state.tasks:
-                    state.tasks[task_id]["status"] = "completed"
-                    state.tasks[task_id]["progress"] = 100
-                    state.tasks[task_id]["message"] = (
-                        state.tasks[task_id].get("message", "Done!") + " [thumb failed]"
+                if tm.exists(task_id):
+                    t = tm.get(task_id)
+                    prev = t.message if t else "Done!"
+                    await tm.update(
+                        task_id,
+                        status=TaskStatus.COMPLETED,
+                        progress=100.0,
+                        message=f"{prev} [thumb failed]",
+                        completed_at=datetime.now().isoformat(),
                     )
-                    state.tasks[task_id]["completed_at"] = datetime.now().isoformat()
 
         except Exception:
             logger.exception("thumbnail_worker")
-            if job and job.get("task_id") in state.tasks:
+            if job and job.get("task_id") and tm.exists(job["task_id"]):
                 tid = job["task_id"]
-                if state.tasks[tid].get("status") == "thumbnail":
-                    state.tasks[tid]["status"] = "completed"
-                    state.tasks[tid]["progress"] = 100
-                    state.tasks[tid]["message"] = (
-                        state.tasks[tid].get("message", "Done!") + " [thumb error]"
+                t = tm.get(tid)
+                if t and t.status == TaskStatus.THUMBNAIL:
+                    prev = t.message if t else "Done!"
+                    await tm.update(
+                        tid,
+                        status=TaskStatus.COMPLETED,
+                        progress=100.0,
+                        message=f"{prev} [thumb error]",
+                        completed_at=datetime.now().isoformat(),
                     )
-                    state.tasks[tid]["completed_at"] = datetime.now().isoformat()
         finally:
-            if state.thumb_queue is not None and job is not None:
-                state.thumb_queue.task_done()
+            if tm.thumb_queue is not None and job is not None:
+                tm.thumb_queue.task_done()

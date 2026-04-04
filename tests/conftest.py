@@ -2,20 +2,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.state import tm
 
 
 @pytest.fixture(autouse=True)
 def _clean_state():
-    """Reset shared task state before/after each test to avoid cross-test leakage."""
-    import app.state as st
-
-    st.tasks.clear()
-    st.active_downloads.clear()
-    st.task_credentials.clear()
+    tm.reset()
     yield
-    st.tasks.clear()
-    st.active_downloads.clear()
-    st.task_credentials.clear()
+    tm.reset()
 
 
 @pytest.fixture

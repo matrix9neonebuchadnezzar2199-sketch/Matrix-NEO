@@ -18,9 +18,16 @@ def _base_dir() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def _bool_env(key: str, default: bool = True) -> bool:
+    raw = os.environ.get(key, "").strip().lower()
+    if not raw:
+        return default
+    return raw not in ("0", "false", "no", "off")
+
+
 BASE_DIR = _base_dir()
-OUTPUT_DIR = str(BASE_DIR / "output")
-TEMP_DIR = str(BASE_DIR / "temp")
+OUTPUT_DIR: Path = BASE_DIR / "output"
+TEMP_DIR: Path = BASE_DIR / "temp"
 
 PORT = int(os.environ.get("MATRIX_NEO_PORT", "6850"))
 
@@ -29,22 +36,18 @@ MAX_THREADS = max(1, int(os.environ.get("MATRIX_NEO_M3U8_THREADS", "32")))
 M3U8_DOWNLOAD_RETRY = max(1, int(os.environ.get("MATRIX_NEO_M3U8_RETRY", "50")))
 M3U8_HTTP_TIMEOUT = int(os.environ.get("MATRIX_NEO_M3U8_HTTP_TIMEOUT", "120"))
 
-_m3u8_mt_env = os.environ.get("MATRIX_NEO_M3U8_MT", "1").strip().lower()
-M3U8_USE_MT = _m3u8_mt_env not in ("0", "false", "no", "off", "")
+M3U8_USE_MT = _bool_env("MATRIX_NEO_M3U8_MT", default=True)
 
 M3U8_MAX_SPEED = os.environ.get("MATRIX_NEO_M3U8_MAX_SPEED", "").strip()
 M3U8_STALL_SEC = float(os.environ.get("MATRIX_NEO_M3U8_STALL_SEC", "120"))
 
-_m3u8_retry_no_mt = os.environ.get("MATRIX_NEO_M3U8_RETRY_NO_MT_ON_STALL", "1").strip().lower()
-M3U8_RETRY_NO_MT_ON_STALL = _m3u8_retry_no_mt not in ("0", "false", "no", "off", "")
+M3U8_RETRY_NO_MT_ON_STALL = _bool_env("MATRIX_NEO_M3U8_RETRY_NO_MT_ON_STALL", default=True)
 
-# SSRF: set to 1 to block private/link-local URLs (may break LAN / localhost streams)
-BLOCK_PRIVATE_IPS = os.environ.get("MATRIX_NEO_BLOCK_PRIVATE_IPS", "0").strip().lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
-)
+# SSRF: enable to block private/link-local URLs (may break LAN / localhost streams)
+BLOCK_PRIVATE_IPS = _bool_env("MATRIX_NEO_BLOCK_PRIVATE_IPS", default=False)
+
+M3U8_BROWSER_HEADERS: bool = _bool_env("MATRIX_NEO_M3U8_BROWSER_HEADERS", default=True)
+M3U8_MUX_TS: bool = _bool_env("MATRIX_NEO_M3U8_MUX_TS", default=True)
 
 # Task GC
 TASK_TTL_HOURS = float(os.environ.get("MATRIX_NEO_TASK_TTL_HOURS", "24"))

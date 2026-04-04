@@ -10,9 +10,9 @@ from datetime import datetime
 from fastapi import APIRouter, HTTPException
 
 from app import config as cfg
-from app import state
-from app.models import YouTubeRequest
+from app.models import TaskState, TaskStatus, YouTubeRequest
 from app.services import youtube_service
+from app.state import tm
 from app.task_id import new_task_id
 from app.utils.validation import validate_http_url
 
@@ -71,37 +71,40 @@ async def youtube_download(request: YouTubeRequest):
     else:
         filename += ".mp4"
 
-    state.tasks[task_id] = {
-        "task_id": task_id,
-        "url": request.url,
-        "filename": filename,
-        "status": "queued",
-        "progress": 0,
-        "message": "Queue...",
-        "type": "youtube",
-        "format": request.format_type,
-        "quality": request.quality,
-        "thumbnail_url": thumbnail_url if request.thumbnail else None,
-        "created_at": datetime.now().isoformat(),
-    }
+    ft = request.format_type or "mp4"
+    await tm.register(
+        TaskState(
+            task_id=task_id,
+            url=request.url,
+            filename=filename,
+            status=TaskStatus.QUEUED,
+            progress=0.0,
+            message="Queue...",
+            type="youtube",
+            format=ft,
+            quality=request.quality,
+            thumbnail_url=thumbnail_url if request.thumbnail else None,
+            created_at=datetime.now().isoformat(),
+        ),
+    )
 
     task = asyncio.create_task(
         youtube_service.run_youtube_download(
             task_id,
             request.url,
             filename,
-            request.format_type,
+            ft,
             request.quality or "1080",
             thumbnail_url if request.thumbnail else None,
         )
     )
-    state.active_downloads[task_id] = task
+    tm.active_downloads[task_id] = task
 
-    logger.info("YT queued: %s (%s, %s)", filename, request.format_type, request.quality)
+    logger.info("YT queued: %s (%s, %s)", filename, ft, request.quality)
 
     return {
         "task_id": task_id,
         "status": "queued",
         "filename": filename,
-        "format": request.format_type,
+        "format": ft,
     }

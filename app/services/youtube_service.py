@@ -8,30 +8,60 @@ import logging
 import os
 import re
 import time
+from collections import OrderedDict
 from datetime import datetime
 from typing import Optional
 
 from fastapi import HTTPException
 
 from app import config as cfg
-from app import state
+from app.constants import (
+    YT_JSON_CACHE_MAX,
+    YT_META_TTL_SEC,
+    YT_PROGRESS_CAP,
+    YT_PROGRESS_EXTRACT_AUDIO,
+    YT_PROGRESS_MERGE,
+    YT_PROGRESS_MULT,
+)
+from app.models import TaskStatus
 from app.services.download_service import terminate_child_process
+from app.state import tm
 from app.utils.paths import YTDLP
 
 logger = logging.getLogger(__name__)
 
-_YT_JSON_CACHE: dict[str, tuple[dict, float]] = {}
-_YT_JSON_CACHE_MAX = 100
-_YT_META_TTL = 300.0
+
+class _LRUCache:
+    def __init__(self, maxsize: int, ttl: float):
+        self._data: OrderedDict[str, tuple[dict, float]] = OrderedDict()
+        self._maxsize = maxsize
+        self._ttl = ttl
+
+    def get(self, key: str) -> dict | None:
+        if key not in self._data:
+            return None
+        value, ts = self._data[key]
+        if time.time() - ts > self._ttl:
+            del self._data[key]
+            return None
+        self._data.move_to_end(key)
+        return value
+
+    def put(self, key: str, value: dict) -> None:
+        self._data[key] = (value, time.time())
+        self._data.move_to_end(key)
+        if len(self._data) > self._maxsize:
+            self._data.popitem(last=False)
+
+
+_yt_cache = _LRUCache(maxsize=YT_JSON_CACHE_MAX, ttl=YT_META_TTL_SEC)
 
 
 async def fetch_youtube_json(url: str) -> dict:
     """Single --dump-json fetch with TTL cache (shared by /youtube/info and /youtube/download)."""
-    now = time.time()
-    if url in _YT_JSON_CACHE:
-        data, ts = _YT_JSON_CACHE[url]
-        if now - ts < _YT_META_TTL:
-            return data
+    cached = _yt_cache.get(url)
+    if cached is not None:
+        return cached
     cmd = [YTDLP, "--dump-json", "--no-playlist", "--", url]
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -47,11 +77,9 @@ async def fetch_youtube_json(url: str) -> dict:
         logger.error("YT dump-json: %s", (stderr or b"").decode("utf-8", errors="ignore")[:500])
         raise HTTPException(status_code=400, detail="Failed to get video info")
     data = json.loads(stdout.decode("utf-8"))
-    _YT_JSON_CACHE[url] = (data, now)
-    if len(_YT_JSON_CACHE) > _YT_JSON_CACHE_MAX:
-        oldest_key = min(_YT_JSON_CACHE, key=lambda k: _YT_JSON_CACHE[k][1])
-        del _YT_JSON_CACHE[oldest_key]
+    _yt_cache.put(url, data)
     return data
+
 
 _RE_YT_PROGRESS = re.compile(r"\[download\]\s+(\d+\.?\d*)%")
 _RE_YT_SPEED = re.compile(r"at\s+(\d+\.?\d*\s*[KMG]?i?B/s)")
@@ -66,13 +94,17 @@ async def run_youtube_download(
     quality: str,
     thumbnail_url: Optional[str] = None,
 ) -> None:
-    async with state.semaphore:
+    _ = thumbnail_url
+    async with tm.semaphore:
         process: Optional[asyncio.subprocess.Process] = None
         try:
-            state.tasks[task_id]["status"] = "downloading"
-            state.tasks[task_id]["message"] = "Starting YouTube download..."
+            await tm.update(
+                task_id,
+                status=TaskStatus.DOWNLOADING,
+                message="Starting YouTube download...",
+            )
 
-            output_path = os.path.join(cfg.OUTPUT_DIR, filename)
+            output_path = str(cfg.OUTPUT_DIR / filename)
 
             if format_type == "mp3":
                 format_spec = f"bestaudio[abr<={quality}]/bestaudio/best"
@@ -119,33 +151,39 @@ async def run_youtube_download(
                 *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
             )
 
-            # yt-dlp はプログレス表示に \r（行上書き）を使うことがあるため、\n だけの split では
-            # 進捗が取れない。bytearray で \r / \n の両方をデリミタにし、O(n²) の文字列連結を避ける。
-            def _apply_yt_line(raw: str) -> None:
+            async def _apply_yt_line(raw: str) -> None:
                 text = raw.strip()
                 if not text:
                     return
                 m = _RE_YT_PROGRESS.search(text)
                 if m:
                     progress = float(m.group(1))
-                    state.tasks[task_id]["progress"] = min(progress * 0.9, 90)
+                    await tm.update(
+                        task_id,
+                        progress=min(progress * YT_PROGRESS_MULT, YT_PROGRESS_CAP),
+                    )
                 sm = _RE_YT_SPEED.search(text)
                 zm = _RE_YT_SIZE.search(text)
                 if m:
-                    msg = f"{state.tasks[task_id]['progress']:.0f}%"
+                    t = tm.get(task_id)
+                    pr = float(t.progress) if t else 0.0
+                    msg = f"{pr:.0f}%"
                     if zm:
                         msg += f" of {zm.group(1)}"
                     if sm:
                         msg += f" ({sm.group(1)})"
-                    state.tasks[task_id]["message"] = msg
+                    await tm.update(task_id, message=msg)
                 if "Merging" in text or "muxing" in text.lower():
-                    state.tasks[task_id]["progress"] = 90
-                    state.tasks[task_id]["message"] = "Merging..."
+                    await tm.update(task_id, progress=float(YT_PROGRESS_MERGE), message="Merging...")
                 if "[ExtractAudio]" in text:
-                    state.tasks[task_id]["progress"] = 85
-                    state.tasks[task_id]["message"] = "Extracting audio..."
+                    await tm.update(
+                        task_id,
+                        progress=float(YT_PROGRESS_EXTRACT_AUDIO),
+                        message="Extracting audio...",
+                    )
 
             buf = bytearray()
+            assert process.stdout is not None
             while True:
                 chunk = await process.stdout.read(4096)
                 if not chunk:
@@ -164,9 +202,9 @@ async def run_youtube_download(
                     else:
                         line = bytes(buf[:i_n])
                         del buf[: i_n + 1]
-                    _apply_yt_line(line.decode("utf-8", errors="ignore"))
+                    await _apply_yt_line(line.decode("utf-8", errors="ignore"))
             if buf:
-                _apply_yt_line(buf.decode("utf-8", errors="ignore"))
+                await _apply_yt_line(buf.decode("utf-8", errors="ignore"))
 
             await process.wait()
             download_time = (datetime.now() - start_time).total_seconds()
@@ -183,26 +221,26 @@ async def run_youtube_download(
                 file_size = os.path.getsize(actual_output)
                 size_mb = file_size / (1024 * 1024)
                 speed_mbps = size_mb / download_time if download_time > 0 else 0
-                state.tasks[task_id]["file_size"] = file_size
-                state.tasks[task_id]["status"] = "completed"
-                state.tasks[task_id]["progress"] = 100
-                state.tasks[task_id]["message"] = f"Done! {size_mb:.1f}MB ({speed_mbps:.1f}MB/s)"
-                state.tasks[task_id]["completed_at"] = datetime.now().isoformat()
+                await tm.update(
+                    task_id,
+                    file_size=file_size,
+                    status=TaskStatus.COMPLETED,
+                    progress=100.0,
+                    message=f"Done! {size_mb:.1f}MB ({speed_mbps:.1f}MB/s)",
+                    completed_at=datetime.now().isoformat(),
+                )
                 logger.info("YT completed: %s (%.1fMB in %.1fs)", filename, size_mb, download_time)
             else:
-                state.tasks[task_id]["status"] = "error"
-                state.tasks[task_id]["message"] = "Download failed"
+                await tm.update(task_id, status=TaskStatus.ERROR, message="Download failed")
                 logger.error("YT failed: %s", filename)
 
         except asyncio.CancelledError:
             if process is not None:
                 await terminate_child_process(process)
-            state.tasks[task_id]["status"] = "error"
-            state.tasks[task_id]["message"] = "Cancelled"
+            await tm.update(task_id, status=TaskStatus.ERROR, message="Cancelled")
             raise
         except Exception as e:
-            state.tasks[task_id]["status"] = "error"
-            state.tasks[task_id]["message"] = str(e)[:50]
+            await tm.update(task_id, status=TaskStatus.ERROR, message=str(e)[:50])
             logger.exception("YT error: %s", e)
         finally:
-            state.active_downloads.pop(task_id, None)
+            tm.active_downloads.pop(task_id, None)

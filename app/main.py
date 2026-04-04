@@ -12,12 +12,12 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app import __version__
 from app import config as cfg
-from app import state
 from app.logging_setup import setup_logging
-from app.routes import download, health, proxy, stop_resume, tasks_read, youtube
+from app.routes import download, events, health, proxy, stop_resume, tasks_read, youtube
 from app.services import http_client
 from app.services import task_gc
 from app.services.thumbnail_service import thumbnail_worker
+from app.state import tm
 
 logger = logging.getLogger(__name__)
 
@@ -28,17 +28,11 @@ async def lifespan(app: FastAPI):
     await http_client.start_client()
     os.makedirs(cfg.OUTPUT_DIR, exist_ok=True)
     os.makedirs(cfg.TEMP_DIR, exist_ok=True)
-    state.thumb_queue = asyncio.Queue()
+    tm.thumb_queue = asyncio.Queue()
     bg_tasks: list[asyncio.Task] = []
     bg_tasks.append(asyncio.create_task(thumbnail_worker()))
     bg_tasks.append(asyncio.create_task(task_gc.task_gc_worker()))
 
-    _mux_ts_on = os.environ.get("MATRIX_NEO_M3U8_MUX_TS", "1").strip().lower() not in (
-        "0",
-        "false",
-        "no",
-        "off",
-    )
     logger.info(
         "MATRIX-NEO v%s — output=%s temp=%s max_concurrent=%s",
         __version__,
@@ -54,11 +48,8 @@ async def lifespan(app: FastAPI):
         cfg.M3U8_USE_MT,
         cfg.M3U8_STALL_SEC if cfg.M3U8_STALL_SEC > 0 else "off",
         cfg.M3U8_MAX_SPEED or "(none)",
-        "on"
-        if os.environ.get("MATRIX_NEO_M3U8_BROWSER_HEADERS", "1").strip().lower()
-        not in ("0", "false", "no", "off")
-        else "off",
-        "on" if _mux_ts_on else "off",
+        "on" if cfg.M3U8_BROWSER_HEADERS else "off",
+        "on" if cfg.M3U8_MUX_TS else "off",
     )
     logger.info("YouTube support: enabled")
 
@@ -89,6 +80,7 @@ def create_app() -> FastAPI:
     app.include_router(youtube.router)
     app.include_router(proxy.router)
     app.include_router(stop_resume.router)
+    app.include_router(events.router)
 
     return app
 

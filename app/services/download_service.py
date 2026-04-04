@@ -9,14 +9,27 @@ import re
 import time
 from collections import deque
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
 import httpx
 
 from app import config as cfg
-from app import state
+from app.constants import (
+    HTTP_CHUNK_SIZE,
+    MIN_VALID_FILE_BYTES,
+    PROGRESS_DIRECT_DL_CAP,
+    PROGRESS_DL_CAP,
+    PROGRESS_MERGE,
+    PROGRESS_NORMALIZE,
+    PROGRESS_THUMB_QUEUE,
+    TERMINATE_WAIT_SEC,
+    THUMB_QUEUE_DELAY_SEC,
+)
+from app.models import TaskStatus
 from app.services import http_client
+from app.state import tm
 from app.utils.file_ops import replace_or_move_overwrite
 from app.utils.filename import sanitize_filename_for_windows
 from app.utils.paths import FFMPEG, N_M3U8DL_RE
@@ -77,7 +90,7 @@ async def terminate_child_process(proc: asyncio.subprocess.Process) -> None:
     except ProcessLookupError:
         return
     try:
-        await asyncio.wait_for(proc.wait(), timeout=20.0)
+        await asyncio.wait_for(proc.wait(), timeout=TERMINATE_WAIT_SEC)
     except asyncio.TimeoutError:
         try:
             proc.kill()
@@ -85,13 +98,8 @@ async def terminate_child_process(proc: asyncio.subprocess.Process) -> None:
             pass
 
 
-def m3u8_static_header_args() -> list:
-    if os.environ.get("MATRIX_NEO_M3U8_BROWSER_HEADERS", "1").strip().lower() in (
-        "0",
-        "false",
-        "no",
-        "off",
-    ):
+def m3u8_static_header_args() -> list[str]:
+    if not cfg.M3U8_BROWSER_HEADERS:
         return []
     ua = cfg.DEFAULT_UA
     return [
@@ -120,15 +128,15 @@ def is_direct_progressive_http_url(url: str) -> bool:
         return False
 
 
-async def download_http_progressive_file(
+async def _run_progressive(
     task_id: str,
     url: str,
-    dest_path: str,
+    output_path: Path,
     cookie: Optional[str],
     referer: Optional[str],
     *,
     resolved_ips: Optional[list[str]] = None,
-) -> bool:
+) -> Optional[Path]:
     ua = cfg.DEFAULT_UA
     headers = {
         "User-Agent": ua,
@@ -147,51 +155,75 @@ async def download_http_progressive_file(
         if host_header:
             headers["Host"] = host_header
 
-    tmp = dest_path + ".part"
+    dest_str = str(output_path)
+    tmp = dest_str + ".part"
     try:
         if os.path.isfile(tmp):
             os.remove(tmp)
     except OSError:
         pass
 
-    # Connect 30s, read idle 5min (chunk stalled); N_m3u8DL/yt-dlp は別経路
     timeout = httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=30.0)
     client = http_client.get_client()
     try:
         async with client.stream("GET", req_url, headers=headers, timeout=timeout) as response:
             if response.status_code < 200 or response.status_code >= 400:
                 logger.warning("direct HTTP status=%s", response.status_code)
-                return False
+                return None
             total = int(response.headers.get("content-length") or 0)
             downloaded = 0
             with open(tmp, "wb") as f:
-                async for chunk in response.aiter_bytes(chunk_size=256 * 1024):
+                async for chunk in response.aiter_bytes(chunk_size=HTTP_CHUNK_SIZE):
                     if not chunk:
                         continue
                     f.write(chunk)
                     downloaded += len(chunk)
                     if total > 0:
-                        state.tasks[task_id]["progress"] = min(88, int(downloaded * 88 / total))
+                        p = min(
+                            PROGRESS_DIRECT_DL_CAP,
+                            int(downloaded * PROGRESS_DIRECT_DL_CAP / total),
+                        )
+                        await tm.update(task_id, progress=float(p))
                     else:
                         mb = downloaded // (1024 * 1024)
-                        state.tasks[task_id]["progress"] = min(88, 5 + mb * 3)
-            if downloaded < 1024 * 1024:
+                        await tm.update(
+                            task_id,
+                            progress=float(min(PROGRESS_DIRECT_DL_CAP, 5 + mb * 3)),
+                        )
+            if downloaded < MIN_VALID_FILE_BYTES:
                 logger.warning("direct file too small: %s bytes", downloaded)
                 try:
                     os.remove(tmp)
                 except OSError:
                     pass
-                return False
-            os.replace(tmp, dest_path)
-            return True
+                return None
+            os.replace(tmp, dest_str)
+            return output_path
+    except httpx.ConnectError:
+        logger.exception("direct HTTP connect")
+        await tm.update(task_id, status=TaskStatus.ERROR, message="Connection failed")
+    except httpx.HTTPStatusError as e:
+        logger.exception("direct HTTP status error")
+        await tm.update(
+            task_id,
+            status=TaskStatus.ERROR,
+            message=f"HTTP {e.response.status_code}",
+        )
+    except OSError as e:
+        logger.exception("direct HTTP file")
+        await tm.update(task_id, status=TaskStatus.ERROR, message=f"File error: {e.strerror}")
+    except httpx.TimeoutError:
+        logger.exception("direct HTTP timeout")
+        await tm.update(task_id, status=TaskStatus.ERROR, message="Timed out")
     except Exception as e:
         logger.exception("direct HTTP: %s", e)
-        try:
-            if os.path.isfile(tmp):
-                os.remove(tmp)
-        except OSError:
-            pass
-        return False
+        await tm.update(task_id, status=TaskStatus.ERROR, message=str(e)[:80])
+    try:
+        if os.path.isfile(tmp):
+            os.remove(tmp)
+    except OSError:
+        pass
+    return None
 
 
 async def ffmpeg_normalize_container_to_mp4(src_path: str) -> bool:
@@ -232,7 +264,7 @@ async def ffmpeg_normalize_container_to_mp4(src_path: str) -> bool:
             continue
         if proc.returncode == 0 and os.path.exists(tmp):
             sz = os.path.getsize(tmp)
-            if sz > 1024 * 1024:
+            if sz > MIN_VALID_FILE_BYTES:
                 try:
                     os.replace(tmp, src_path)
                     return True
@@ -253,6 +285,393 @@ async def ffmpeg_normalize_container_to_mp4(src_path: str) -> bool:
     return False
 
 
+async def _remux_ts_to_mp4(raw_path: str, output_path: Path) -> bool:
+    remux_cmd = [
+        FFMPEG,
+        "-y",
+        "-fflags",
+        "+genpts",
+        "-i",
+        raw_path,
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0",
+        "-c",
+        "copy",
+        "-bsf:v",
+        "h264_mp4toannexb,h264_redundant_pps",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ]
+    remux_proc = await asyncio.create_subprocess_exec(
+        *remux_cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    await remux_proc.wait()
+    return bool(
+        os.path.exists(str(output_path)) and os.path.getsize(str(output_path)) > MIN_VALID_FILE_BYTES
+    )
+
+
+async def _run_m3u8(
+    task_id: str,
+    url: str,
+    filename: str,
+    output_path: Path,
+    cookie: Optional[str],
+    referer: Optional[str],
+) -> tuple[Optional[Path], bool]:
+    """Run N_m3u8DL-RE; returns (media path or None, killed_stall)."""
+    base_name = filename.rsplit(".", 1)[0]
+    save_name_dl = "mneo_" + re.sub(r"[^0-9A-Za-z_]+", "_", task_id).strip("_")
+
+    def _build_m3u8_cmd(use_mt: bool) -> list[str]:
+        out_dir = str(cfg.OUTPUT_DIR)
+        temp_dir = str(cfg.TEMP_DIR)
+        c = [
+            N_M3U8DL_RE,
+            url,
+            "--save-dir",
+            out_dir,
+            "--save-name",
+            save_name_dl,
+            "--auto-select",
+            "--thread-count",
+            str(cfg.MAX_THREADS),
+            "--download-retry-count",
+            str(cfg.M3U8_DOWNLOAD_RETRY),
+            "--http-request-timeout",
+            str(cfg.M3U8_HTTP_TIMEOUT),
+            "--tmp-dir",
+            temp_dir,
+            "--no-log",
+            "--del-after-done",
+        ]
+        if cfg.M3U8_MUX_TS:
+            c.extend(
+                [
+                    "--binary-merge",
+                    "-M",
+                    "format=ts:muxer=ffmpeg:keep=false",
+                ]
+            )
+        if use_mt:
+            c.append("-mt")
+        if cfg.M3U8_MAX_SPEED:
+            c.extend(["--max-speed", cfg.M3U8_MAX_SPEED])
+        if FFMPEG and FFMPEG != "ffmpeg" and os.path.isfile(FFMPEG):
+            c.extend(["--ffmpeg-binary-path", FFMPEG])
+        c.extend(m3u8_static_header_args())
+        if cookie and cookie.strip():
+            c.extend(["--header", f"Cookie: {cookie.strip()}"])
+        if referer and referer.strip():
+            c.extend(["--header", f"Referer: {referer.strip()}"])
+        return c
+
+    attempt_mt = cfg.M3U8_USE_MT
+    killed_stall = False
+    process: Optional[asyncio.subprocess.Process] = None
+
+    try:
+        for attempt_round in range(2):
+            cmd = _build_m3u8_cmd(attempt_mt)
+            stall_monitor = M3u8StallMonitor(cfg.M3U8_STALL_SEC)
+
+            if attempt_round == 0:
+                logger.info(
+                    "Starting HLS: %s [save_name=%s threads=%s retry=%s mt=%s stall=%ss]",
+                    filename,
+                    save_name_dl,
+                    cfg.MAX_THREADS,
+                    cfg.M3U8_DOWNLOAD_RETRY,
+                    attempt_mt,
+                    cfg.M3U8_STALL_SEC,
+                )
+            else:
+                logger.info("Retry (stall recovery): mt=%s", attempt_mt)
+                await tm.update(task_id, message="Retrying download without -mt...")
+
+            process = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+            )
+
+            is_merging = False
+            killed_stall = False
+            last_lines: deque[str] = deque(maxlen=5)
+            assert process.stdout is not None
+            async for line in process.stdout:
+                text = line.decode("utf-8", errors="ignore").strip()
+                if not text:
+                    continue
+                last_lines.append(text)
+                logger.debug("N_m3u8DL %s", text)
+
+                if stall_monitor.feed(text):
+                    killed_stall = True
+                    logger.warning("Stall at 0.00Bps for %ss — terminating", cfg.M3U8_STALL_SEC)
+                    await tm.update(task_id, message="Stalled — stopping downloader...")
+                    await terminate_child_process(process)
+                    break
+
+                tl = text.lower()
+                if "mux" in tl or "merge" in tl or "muxing" in tl:
+                    if not is_merging:
+                        is_merging = True
+                        await tm.update(
+                            task_id,
+                            status=TaskStatus.MERGING,
+                            progress=float(PROGRESS_MERGE),
+                            message="Merging segments...",
+                        )
+                    continue
+
+                progress_match = _RE_PROGRESS_PCT.search(text)
+                if progress_match and not is_merging:
+                    raw_progress = float(progress_match.group(1))
+                    await tm.update(
+                        task_id,
+                        progress=min(raw_progress * 0.8, PROGRESS_DL_CAP),
+                    )
+
+                speed_match = _RE_SPEED.search(text)
+                size_match = _RE_SIZE_SLASH.search(text)
+                if speed_match and not is_merging:
+                    t = tm.get(task_id)
+                    cur_prog = float(t.progress) if t else 0.0
+                    msg = f"{cur_prog:.0f}%"
+                    if size_match:
+                        msg += f" - {size_match.group(1)}"
+                    msg += f" ({speed_match.group(1)})"
+                    await tm.update(task_id, message=msg)
+
+            await process.wait()
+            logger.info("N_m3u8DL exit code: %s", process.returncode)
+            if process.returncode != 0 and not killed_stall:
+                tail = " | ".join(last_lines)
+                logger.warning(
+                    "N_m3u8DL non-zero exit=%s for %s tail=%s",
+                    process.returncode,
+                    filename,
+                    tail[:400],
+                )
+                await tm.update(task_id, message=f"N_m3u8DL exit {process.returncode}")
+
+            if (
+                killed_stall
+                and attempt_round == 0
+                and cfg.M3U8_USE_MT
+                and cfg.M3U8_RETRY_NO_MT_ON_STALL
+                and attempt_mt
+            ):
+                attempt_mt = False
+                continue
+            break
+    except asyncio.CancelledError:
+        if process is not None and process.returncode is None:
+            await terminate_child_process(process)
+        raise
+
+    def _pick_downloaded_media(prefix: str) -> Optional[str]:
+        od = str(cfg.OUTPUT_DIR)
+        for ext in (".ts", ".mp4", ".m4s", ".mkv"):
+            p = os.path.join(od, prefix + ext)
+            if os.path.isfile(p) and os.path.getsize(p) > MIN_VALID_FILE_BYTES:
+                return p
+        return None
+
+    raw_output = _pick_downloaded_media(save_name_dl)
+    if not raw_output:
+        raw_output = _pick_downloaded_media(base_name)
+    outp = str(output_path)
+    if not raw_output and os.path.isfile(outp) and os.path.getsize(outp) > MIN_VALID_FILE_BYTES:
+        raw_output = outp
+
+    if not raw_output:
+        return None, killed_stall
+
+    file_exists = os.path.exists(raw_output)
+    file_size = os.path.getsize(raw_output) if file_exists else 0
+    if not file_exists or file_size <= MIN_VALID_FILE_BYTES:
+        return None, killed_stall
+
+    # Rename/move to user output_path when downloader used ASCII save_name
+    if raw_output.endswith(".mp4") and os.path.normcase(os.path.normpath(raw_output)) != os.path.normcase(
+        os.path.normpath(outp)
+    ):
+        try:
+            replace_or_move_overwrite(raw_output, outp)
+            logger.info(
+                "Renamed %s → %s",
+                os.path.basename(raw_output),
+                os.path.basename(outp),
+            )
+            raw_output = outp
+            file_size = os.path.getsize(outp)
+        except OSError as e:
+            logger.error("Rename to output_path failed: %s", e)
+
+    return Path(raw_output), killed_stall
+
+
+async def _enqueue_or_complete_hls(
+    task_id: str,
+    filename: str,
+    output_path: Path,
+    file_size: int,
+    size_mb: float,
+    speed_mbps: float,
+    download_time: float,
+    thumbnail_url: Optional[str],
+    cookie: Optional[str],
+    referer: Optional[str],
+) -> None:
+    await tm.update(task_id, file_size=file_size)
+    if thumbnail_url and tm.thumb_queue:
+        await asyncio.sleep(THUMB_QUEUE_DELAY_SEC)
+        await tm.update(
+            task_id,
+            status=TaskStatus.THUMBNAIL,
+            progress=float(PROGRESS_THUMB_QUEUE),
+            message=f"Done DL ({size_mb:.1f}MB) - Processing thumbnail...",
+        )
+        await tm.thumb_queue.put(
+            {
+                "video_path": str(output_path),
+                "thumb_url": thumbnail_url,
+                "task_id": task_id,
+                "cookie": cookie,
+                "referer": referer,
+            }
+        )
+        logger.info(
+            "Completed: %s (%.1f MB in %.1fs) thumb queued",
+            filename,
+            size_mb,
+            download_time,
+        )
+    else:
+        await tm.update(
+            task_id,
+            status=TaskStatus.COMPLETED,
+            progress=100.0,
+            message=f"Done! {size_mb:.1f}MB ({speed_mbps:.1f}MB/s)",
+            completed_at=datetime.now().isoformat(),
+        )
+        logger.info("Completed: %s [no thumb]", filename)
+
+
+async def _postprocess_and_finalize(
+    task_id: str,
+    filename: str,
+    raw_path: Path,
+    output_path: Path,
+    thumbnail_url: Optional[str],
+    cookie: Optional[str],
+    referer: Optional[str],
+    *,
+    download_time: float,
+    from_progressive: bool,
+) -> None:
+    outp = str(output_path)
+    raw_s = str(raw_path)
+
+    if from_progressive:
+        file_size = os.path.getsize(outp)
+        size_mb = file_size / (1024 * 1024)
+        speed_mbps = size_mb / download_time if download_time > 0 else 0
+        await tm.update(
+            task_id,
+            progress=float(PROGRESS_DIRECT_DL_CAP),
+            file_size=file_size,
+        )
+        if thumbnail_url and tm.thumb_queue:
+            await asyncio.sleep(THUMB_QUEUE_DELAY_SEC)
+            await tm.update(
+                task_id,
+                status=TaskStatus.THUMBNAIL,
+                progress=float(PROGRESS_THUMB_QUEUE),
+                message=f"Done DL ({size_mb:.1f}MB) - Processing thumbnail...",
+            )
+            await tm.thumb_queue.put(
+                {
+                    "video_path": outp,
+                    "thumb_url": thumbnail_url,
+                    "task_id": task_id,
+                    "cookie": cookie,
+                    "referer": referer,
+                }
+            )
+            logger.info(
+                "Completed: %s (%.1f MB, %.1f MB/s) thumb queued",
+                filename,
+                size_mb,
+                speed_mbps,
+            )
+        else:
+            await tm.update(
+                task_id,
+                status=TaskStatus.COMPLETED,
+                progress=100.0,
+                message=f"Done! {size_mb:.1f}MB ({speed_mbps:.1f}MB/s)",
+                completed_at=datetime.now().isoformat(),
+            )
+            logger.info("Completed: %s [no thumb]", filename)
+        return
+
+    file_size = os.path.getsize(raw_s)
+    size_mb = file_size / (1024 * 1024)
+    speed_mbps = size_mb / download_time if download_time > 0 else 0
+
+    if not raw_s.endswith(".mp4"):
+        await tm.update(
+            task_id,
+            status=TaskStatus.MERGING,
+            progress=float(PROGRESS_MERGE),
+            message=f"Converting to MP4... ({size_mb:.1f}MB)",
+        )
+        logger.info("Remux TS→MP4: %s", os.path.basename(raw_s))
+
+        if await _remux_ts_to_mp4(raw_s, output_path):
+            os.remove(raw_s)
+            file_size = os.path.getsize(outp)
+            size_mb = file_size / (1024 * 1024)
+            logger.info("Remux done: %s (%.1fMB)", filename, size_mb)
+        else:
+            logger.warning("Remux failed, keeping original: %s", os.path.basename(raw_s))
+            if raw_s != outp:
+                os.rename(raw_s, outp)
+    else:
+        await tm.update(
+            task_id,
+            status=TaskStatus.MERGING,
+            progress=float(PROGRESS_NORMALIZE),
+            message="Normalizing MP4...",
+        )
+        logger.info("Normalizing MP4: %s", filename)
+        if await ffmpeg_normalize_container_to_mp4(outp):
+            file_size = os.path.getsize(outp)
+            size_mb = file_size / (1024 * 1024)
+            logger.info("MP4 normalized OK (%.1fMB)", size_mb)
+        else:
+            logger.warning("MP4 normalize failed — thumbnail embed may fail")
+
+    await _enqueue_or_complete_hls(
+        task_id,
+        filename,
+        output_path,
+        file_size,
+        size_mb,
+        speed_mbps,
+        download_time,
+        thumbnail_url,
+        cookie,
+        referer,
+    )
+
+
 async def run_download(
     task_id: str,
     url: str,
@@ -263,372 +682,84 @@ async def run_download(
     referer: Optional[str] = None,
     resolved_ips: Optional[list[str]] = None,
 ) -> None:
-    async with state.semaphore:
-        process: Optional[asyncio.subprocess.Process] = None
+    _ = request_quality
+    async with tm.semaphore:
+        wall_start = datetime.now()
         try:
             filename = sanitize_filename_for_windows(filename)
-            if task_id in state.tasks:
-                state.tasks[task_id]["filename"] = filename
-
-            state.tasks[task_id]["status"] = "downloading"
-            state.tasks[task_id]["message"] = "Starting..."
-
-            output_path = os.path.join(cfg.OUTPUT_DIR, filename)
-            base_name = filename.rsplit(".", 1)[0]
+            await tm.update(task_id, filename=filename, status=TaskStatus.DOWNLOADING, message="Starting...")
+            output_path = cfg.OUTPUT_DIR / filename
 
             if is_direct_progressive_http_url(url):
-                state.tasks[task_id]["message"] = "Downloading (HTTP)..."
-                wall_start = datetime.now()
-                ok = await download_http_progressive_file(
-                    task_id,
-                    url,
-                    output_path,
-                    cookie,
-                    referer,
-                    resolved_ips=resolved_ips,
+                await tm.update(task_id, message="Downloading (HTTP)...")
+                raw = await _run_progressive(
+                    task_id, url, output_path, cookie, referer, resolved_ips=resolved_ips
                 )
                 download_time = (datetime.now() - wall_start).total_seconds()
-                if (
-                    not ok
-                    or not os.path.isfile(output_path)
-                    or os.path.getsize(output_path) < 1024 * 1024
-                ):
-                    state.tasks[task_id]["status"] = "error"
-                    state.tasks[task_id]["message"] = "Direct download failed"
-                    logger.error("Direct download failed: %s", filename)
-                    return
-                file_size = os.path.getsize(output_path)
-                size_mb = file_size / (1024 * 1024)
-                speed_mbps = size_mb / download_time if download_time > 0 else 0
-                state.tasks[task_id]["progress"] = 88
-                state.tasks[task_id]["file_size"] = file_size
-                logger.info("Direct HTTP OK: %s (%.1fMB)", filename, size_mb)
-                if thumbnail_url and state.thumb_queue:
-                    await asyncio.sleep(0.75)
-                    state.tasks[task_id]["status"] = "thumbnail"
-                    state.tasks[task_id]["progress"] = 90
-                    state.tasks[task_id]["message"] = (
-                        f"Done DL ({size_mb:.1f}MB) - Processing thumbnail..."
-                    )
-                    await state.thumb_queue.put(
-                        {
-                            "video_path": output_path,
-                            "thumb_url": thumbnail_url,
-                            "task_id": task_id,
-                            "cookie": cookie,
-                            "referer": referer,
-                        }
-                    )
-                    logger.info(
-                        "Completed: %s (%.1f MB, %.1f MB/s) thumb queued",
+                if raw and raw.exists() and raw.stat().st_size >= MIN_VALID_FILE_BYTES:
+                    # _run_progressive may have already set ERROR on httpx failures; re-check task
+                    t = tm.get(task_id)
+                    if t and t.status == TaskStatus.ERROR:
+                        return
+                    await _postprocess_and_finalize(
+                        task_id,
                         filename,
-                        size_mb,
-                        speed_mbps,
+                        raw,
+                        output_path,
+                        thumbnail_url,
+                        cookie,
+                        referer,
+                        download_time=download_time,
+                        from_progressive=True,
                     )
                 else:
-                    state.tasks[task_id]["status"] = "completed"
-                    state.tasks[task_id]["progress"] = 100
-                    state.tasks[task_id]["message"] = f"Done! {size_mb:.1f}MB ({speed_mbps:.1f}MB/s)"
-                    state.tasks[task_id]["completed_at"] = datetime.now().isoformat()
-                    logger.info("Completed: %s [no thumb]", filename)
+                    t = tm.get(task_id)
+                    if t and t.status != TaskStatus.ERROR:
+                        await tm.update(task_id, status=TaskStatus.ERROR, message="Direct download failed")
+                    logger.error("Direct download failed: %s", filename)
                 return
 
-            # N_m3u8DL-RE は子プロセス内で独自に DNS 解決するため、ここでの検証後に IP が
-            # 切り替わる（DNS rebinding）リスクは完全には排除できない。
-            save_name_dl = "mneo_" + re.sub(r"[^0-9A-Za-z_]+", "_", task_id).strip("_")
-
-            _mux_ts = os.environ.get("MATRIX_NEO_M3U8_MUX_TS", "1").strip().lower() not in (
-                "0",
-                "false",
-                "no",
-                "off",
+            raw_result, killed_stall = await _run_m3u8(
+                task_id, url, filename, output_path, cookie, referer
             )
-
-            def _build_m3u8_cmd(use_mt: bool) -> list:
-                # N_m3u8DL-RE は `N_m3u8DL-RE <input> [options]` で URL が先頭必須のため、
-                # POSIX 風の「末尾 `--` + URL」は使えない。create_subprocess_exec なのでシェル
-                # インジェクションは発生しにくい（先頭が `-` の URL は実質稀）。
-                c = [
-                    N_M3U8DL_RE,
-                    url,
-                    "--save-dir",
-                    cfg.OUTPUT_DIR,
-                    "--save-name",
-                    save_name_dl,
-                    "--auto-select",
-                    "--thread-count",
-                    str(cfg.MAX_THREADS),
-                    "--download-retry-count",
-                    str(cfg.M3U8_DOWNLOAD_RETRY),
-                    "--http-request-timeout",
-                    str(cfg.M3U8_HTTP_TIMEOUT),
-                    "--tmp-dir",
-                    cfg.TEMP_DIR,
-                    "--no-log",
-                    "--del-after-done",
-                ]
-                if _mux_ts:
-                    c.extend(
-                        [
-                            "--binary-merge",
-                            "-M",
-                            "format=ts:muxer=ffmpeg:keep=false",
-                        ]
-                    )
-                if use_mt:
-                    c.append("-mt")
-                if cfg.M3U8_MAX_SPEED:
-                    c.extend(["--max-speed", cfg.M3U8_MAX_SPEED])
-                if FFMPEG and FFMPEG != "ffmpeg" and os.path.isfile(FFMPEG):
-                    c.extend(["--ffmpeg-binary-path", FFMPEG])
-                c.extend(m3u8_static_header_args())
-                if cookie and cookie.strip():
-                    c.extend(["--header", f"Cookie: {cookie.strip()}"])
-                if referer and referer.strip():
-                    c.extend(["--header", f"Referer: {referer.strip()}"])
-                return c
-
-            attempt_mt = cfg.M3U8_USE_MT
-            killed_stall = False
-            process: Optional[asyncio.subprocess.Process] = None
-            wall_start = datetime.now()
-
-            for attempt_round in range(2):
-                cmd = _build_m3u8_cmd(attempt_mt)
-                stall_monitor = M3u8StallMonitor(cfg.M3U8_STALL_SEC)
-
-                if attempt_round == 0:
-                    logger.info(
-                        "Starting HLS: %s [save_name=%s threads=%s retry=%s mt=%s stall=%ss]",
-                        filename,
-                        save_name_dl,
-                        cfg.MAX_THREADS,
-                        cfg.M3U8_DOWNLOAD_RETRY,
-                        attempt_mt,
-                        cfg.M3U8_STALL_SEC,
-                    )
-                else:
-                    logger.info("Retry (stall recovery): mt=%s", attempt_mt)
-                    state.tasks[task_id]["message"] = "Retrying download without -mt..."
-
-                process = await asyncio.create_subprocess_exec(
-                    *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
-                )
-
-                is_merging = False
-                killed_stall = False
-                last_lines: deque[str] = deque(maxlen=5)
-                async for line in process.stdout:
-                    text = line.decode("utf-8", errors="ignore").strip()
-                    if not text:
-                        continue
-                    last_lines.append(text)
-                    logger.debug("N_m3u8DL %s", text)
-
-                    if stall_monitor.feed(text):
-                        killed_stall = True
-                        logger.warning(
-                            "Stall at 0.00Bps for %ss — terminating", cfg.M3U8_STALL_SEC
-                        )
-                        state.tasks[task_id]["message"] = "Stalled — stopping downloader..."
-                        await terminate_child_process(process)
-                        break
-
-                    if "mux" in text.lower() or "merge" in text.lower() or "muxing" in text.lower():
-                        if not is_merging:
-                            is_merging = True
-                            state.tasks[task_id]["status"] = "merging"
-                            state.tasks[task_id]["progress"] = 85
-                            state.tasks[task_id]["message"] = "Merging segments..."
-                        continue
-
-                    progress_match = _RE_PROGRESS_PCT.search(text)
-                    if progress_match and not is_merging:
-                        raw_progress = float(progress_match.group(1))
-                        state.tasks[task_id]["progress"] = min(raw_progress * 0.8, 80)
-
-                    speed_match = _RE_SPEED.search(text)
-                    size_match = _RE_SIZE_SLASH.search(text)
-                    if speed_match and not is_merging:
-                        msg = f"{state.tasks[task_id]['progress']:.0f}%"
-                        if size_match:
-                            msg += f" - {size_match.group(1)}"
-                        msg += f" ({speed_match.group(1)})"
-                        state.tasks[task_id]["message"] = msg
-
-                await process.wait()
-                logger.info("N_m3u8DL exit code: %s", process.returncode)
-                if process.returncode != 0 and not killed_stall:
-                    tail = " | ".join(last_lines)
-                    logger.warning(
-                        "N_m3u8DL non-zero exit=%s for %s tail=%s",
-                        process.returncode,
-                        filename,
-                        tail[:400],
-                    )
-                    state.tasks[task_id][
-                        "message"
-                    ] = f"N_m3u8DL exit {process.returncode}"
-
-                if (
-                    killed_stall
-                    and attempt_round == 0
-                    and cfg.M3U8_USE_MT
-                    and cfg.M3U8_RETRY_NO_MT_ON_STALL
-                    and attempt_mt
-                ):
-                    attempt_mt = False
-                    continue
-                break
-
             download_time = (datetime.now() - wall_start).total_seconds()
 
-            def _pick_downloaded_media(prefix: str) -> Optional[str]:
-                for ext in (".ts", ".mp4", ".m4s", ".mkv"):
-                    p = os.path.join(cfg.OUTPUT_DIR, prefix + ext)
-                    if os.path.isfile(p) and os.path.getsize(p) > 1024 * 1024:
-                        return p
-                return None
-
-            raw_output = _pick_downloaded_media(save_name_dl)
-            if not raw_output:
-                raw_output = _pick_downloaded_media(base_name)
-            if not raw_output and os.path.isfile(output_path) and os.path.getsize(output_path) > 1024 * 1024:
-                raw_output = output_path
-
-            file_exists = raw_output is not None and os.path.exists(raw_output)
-            file_size = os.path.getsize(raw_output) if file_exists else 0
-
-            if file_exists and file_size > 1024 * 1024:
-                # save_name（ASCII）とユーザー指定 filename が異なると .mp4 が mneo_* に残り、
-                # 正規化が空の output_path を参照する。先に希望パスへ寄せる。
-                if raw_output.endswith(".mp4") and os.path.normcase(
-                    os.path.normpath(raw_output)
-                ) != os.path.normcase(os.path.normpath(output_path)):
-                    try:
-                        replace_or_move_overwrite(raw_output, output_path)
-                        logger.info(
-                            "Renamed %s → %s",
-                            os.path.basename(raw_output),
-                            os.path.basename(output_path),
-                        )
-                        raw_output = output_path
-                        file_size = os.path.getsize(output_path)
-                    except OSError as e:
-                        logger.error("Rename to output_path failed: %s", e)
-
-                size_mb = file_size / (1024 * 1024)
-                speed_mbps = size_mb / download_time if download_time > 0 else 0
-
-                if not raw_output.endswith(".mp4"):
-                    state.tasks[task_id]["status"] = "merging"
-                    state.tasks[task_id]["progress"] = 85
-                    state.tasks[task_id]["message"] = f"Converting to MP4... ({size_mb:.1f}MB)"
-                    logger.info("Remux TS→MP4: %s", os.path.basename(raw_output))
-
-                    remux_cmd = [
-                        FFMPEG,
-                        "-y",
-                        "-fflags",
-                        "+genpts",
-                        "-i",
-                        raw_output,
-                        "-map",
-                        "0:v:0",
-                        "-map",
-                        "0:a:0",
-                        "-c",
-                        "copy",
-                        "-bsf:v",
-                        "h264_mp4toannexb,h264_redundant_pps",
-                        "-movflags",
-                        "+faststart",
-                        output_path,
-                    ]
-                    remux_proc = await asyncio.create_subprocess_exec(
-                        *remux_cmd,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.STDOUT,
-                    )
-                    await remux_proc.wait()
-
-                    if os.path.exists(output_path) and os.path.getsize(output_path) > 1024 * 1024:
-                        os.remove(raw_output)
-                        file_size = os.path.getsize(output_path)
-                        size_mb = file_size / (1024 * 1024)
-                        logger.info("Remux done: %s (%.1fMB)", filename, size_mb)
-                    else:
-                        logger.warning("Remux failed, keeping original: %s", os.path.basename(raw_output))
-                        if raw_output != output_path:
-                            os.rename(raw_output, output_path)
-                else:
-                    state.tasks[task_id]["status"] = "merging"
-                    state.tasks[task_id]["progress"] = 88
-                    state.tasks[task_id]["message"] = "Normalizing MP4..."
-                    logger.info("Normalizing MP4: %s", filename)
-                    if await ffmpeg_normalize_container_to_mp4(output_path):
-                        file_size = os.path.getsize(output_path)
-                        size_mb = file_size / (1024 * 1024)
-                        logger.info("MP4 normalized OK (%.1fMB)", size_mb)
-                    else:
-                        logger.warning("MP4 normalize failed — thumbnail embed may fail")
-
-                state.tasks[task_id]["file_size"] = file_size
-
-                if thumbnail_url and state.thumb_queue:
-                    await asyncio.sleep(0.75)
-                    state.tasks[task_id]["status"] = "thumbnail"
-                    state.tasks[task_id]["progress"] = 90
-                    state.tasks[task_id]["message"] = (
-                        f"Done DL ({size_mb:.1f}MB) - Processing thumbnail..."
-                    )
-
-                    await state.thumb_queue.put(
-                        {
-                            "video_path": output_path,
-                            "thumb_url": thumbnail_url,
-                            "task_id": task_id,
-                            "cookie": cookie,
-                            "referer": referer,
-                        }
-                    )
-                    logger.info(
-                        "Completed: %s (%.1f MB in %.1fs) thumb queued",
-                        filename,
-                        size_mb,
-                        download_time,
-                    )
-                else:
-                    state.tasks[task_id]["status"] = "completed"
-                    state.tasks[task_id]["progress"] = 100
-                    state.tasks[task_id]["message"] = f"Done! {size_mb:.1f}MB ({speed_mbps:.1f}MB/s)"
-                    state.tasks[task_id]["completed_at"] = datetime.now().isoformat()
-                    logger.info("Completed: %s [no thumb]", filename)
-            else:
-                state.tasks[task_id]["status"] = "error"
-                if killed_stall:
-                    state.tasks[task_id]["message"] = (
-                        "Stalled (0 Bps). Set MATRIX_NEO_M3U8_MT=0 or increase MATRIX_NEO_M3U8_STALL_SEC"
-                    )
-                else:
-                    state.tasks[task_id]["message"] = "Download failed"
-                logger.error(
-                    "Failed: %s (exists=%s size=%s stall=%s)",
+            if raw_result and raw_result.exists() and raw_result.stat().st_size > MIN_VALID_FILE_BYTES:
+                await _postprocess_and_finalize(
+                    task_id,
                     filename,
-                    file_exists,
-                    file_size,
+                    raw_result,
+                    output_path,
+                    thumbnail_url,
+                    cookie,
+                    referer,
+                    download_time=download_time,
+                    from_progressive=False,
+                )
+            else:
+                if killed_stall:
+                    await tm.update(
+                        task_id,
+                        status=TaskStatus.ERROR,
+                        message=(
+                            "Stalled (0 Bps). Set MATRIX_NEO_M3U8_MT=0 or increase "
+                            "MATRIX_NEO_M3U8_STALL_SEC"
+                        ),
+                    )
+                else:
+                    await tm.update(task_id, status=TaskStatus.ERROR, message="Download failed")
+                logger.error(
+                    "Failed: %s (raw=%s stall=%s)",
+                    filename,
+                    raw_result,
                     killed_stall,
                 )
 
         except asyncio.CancelledError:
-            if process is not None:
-                await terminate_child_process(process)
-            state.tasks[task_id]["status"] = "error"
-            state.tasks[task_id]["message"] = "Cancelled"
+            await tm.update(task_id, status=TaskStatus.ERROR, message="Cancelled")
             raise
         except Exception as e:
-            state.tasks[task_id]["status"] = "error"
-            state.tasks[task_id]["message"] = str(e)[:50]
+            await tm.update(task_id, status=TaskStatus.ERROR, message=str(e)[:80])
             logger.exception("run_download: %s", e)
         finally:
-            state.active_downloads.pop(task_id, None)
+            tm.active_downloads.pop(task_id, None)

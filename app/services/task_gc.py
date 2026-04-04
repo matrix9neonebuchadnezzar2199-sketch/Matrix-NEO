@@ -7,7 +7,8 @@ import logging
 from datetime import datetime, timedelta
 
 from app import config as cfg
-from app import state
+from app.models import TaskStatus
+from app.state import tm
 
 logger = logging.getLogger(__name__)
 
@@ -20,12 +21,12 @@ async def task_gc_worker() -> None:
             await asyncio.sleep(interval)
             now = datetime.now()
             expired: list[str] = []
-            for tid, t in list(state.tasks.items()):
-                st = t.get("status")
-                if st in ("completed", "error"):
-                    ca = t.get("completed_at")
-                elif st == "stopped":
-                    ca = t.get("stopped_at")
+            for tid, t in list(tm.tasks.items()):
+                st = t.status
+                if st in (TaskStatus.COMPLETED, TaskStatus.ERROR):
+                    ca = t.completed_at
+                elif st == TaskStatus.STOPPED:
+                    ca = t.stopped_at
                 else:
                     continue
                 if not ca:
@@ -36,12 +37,11 @@ async def task_gc_worker() -> None:
                     continue
                 if now - ts > ttl:
                     expired.append(tid)
-            for tid in expired:
-                state.tasks.pop(tid, None)
-                state.task_credentials.pop(tid, None)
-                logger.debug("task GC removed %s", tid)
             if expired:
-                logger.info("task GC removed %s completed/error task(s)", len(expired))
+                n = await tm.remove_many(expired)
+                for tid in expired:
+                    logger.debug("task GC removed %s", tid)
+                logger.info("task GC removed %s completed/error task(s)", n)
         except asyncio.CancelledError:
             raise
         except Exception:

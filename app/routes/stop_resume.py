@@ -4,15 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from datetime import datetime
 
 from fastapi import APIRouter, HTTPException
 
 from app import config as cfg
-from app import state
+from app.models import TaskState, TaskStatus
 from app.services import youtube_service
 from app.services.download_service import run_download
+from app.state import tm
 from app.task_id import new_task_id
 from app.utils.validation import validate_http_url
 
@@ -22,13 +22,12 @@ logger = logging.getLogger(__name__)
 
 @router.post("/task/{task_id}/stop")
 async def stop_task(task_id: str):
-    if task_id not in state.tasks:
+    task = tm.get(task_id)
+    if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    task = state.tasks[task_id]
-
-    if task_id in state.active_downloads:
-        dl_task = state.active_downloads[task_id]
+    if task_id in tm.active_downloads:
+        dl_task = tm.active_downloads[task_id]
         dl_task.cancel()
         try:
             await dl_task
@@ -36,18 +35,21 @@ async def stop_task(task_id: str):
             pass
         except Exception:
             logger.exception("stop_task await download")
-    state.active_downloads.pop(task_id, None)
+    tm.active_downloads.pop(task_id, None)
 
-    partial = os.path.join(cfg.OUTPUT_DIR, task.get("filename", ""))
-    if partial and os.path.isfile(partial):
+    partial = cfg.OUTPUT_DIR / task.filename
+    if partial.is_file():
         try:
-            os.remove(partial)
+            partial.unlink()
         except OSError as e:
             logger.debug("stop remove partial: %s", e)
 
-    state.tasks[task_id]["status"] = "stopped"
-    state.tasks[task_id]["message"] = "Stopped"
-    state.tasks[task_id]["stopped_at"] = datetime.now().isoformat()
+    await tm.update(
+        task_id,
+        status=TaskStatus.STOPPED,
+        message="Stopped",
+        stopped_at=datetime.now().isoformat(),
+    )
 
     logger.info("Task stopped: %s", task_id)
     return {"status": "stopped", "task_id": task_id, "can_resume": True}
@@ -55,69 +57,73 @@ async def stop_task(task_id: str):
 
 @router.post("/task/{task_id}/resume")
 async def resume_task(task_id: str):
-    if task_id not in state.tasks or state.tasks[task_id].get("status") != "stopped":
+    cur = tm.get(task_id)
+    if not cur or cur.status != TaskStatus.STOPPED:
         raise HTTPException(status_code=404, detail="Stopped task not found")
 
-    info = state.tasks[task_id]
-    _, resolved_ips = validate_http_url(info["url"], block_private_ips=cfg.BLOCK_PRIVATE_IPS)
-    cred = state.task_credentials.get(task_id, {})
+    _, resolved_ips = validate_http_url(cur.url, block_private_ips=cfg.BLOCK_PRIVATE_IPS)
+    cred = tm.task_credentials.get(task_id, {})
     ck, rk = cred.get("cookie"), cred.get("referer")
     new_id = new_task_id()
 
-    if info.get("type") == "youtube":
-        state.tasks[new_id] = {
-            "task_id": new_id,
-            "status": "queued",
-            "progress": 0,
-            "filename": info["filename"],
-            "message": "Resuming...",
-            "url": info["url"],
-            "type": "youtube",
-            "quality": info.get("quality"),
-            "thumbnail_url": info.get("thumbnail_url"),
-            "format": info.get("format"),
-            "created_at": datetime.now().isoformat(),
-        }
+    if cur.type == "youtube":
+        await tm.register(
+            TaskState(
+                task_id=new_id,
+                status=TaskStatus.QUEUED,
+                progress=0.0,
+                filename=cur.filename,
+                message="Resuming...",
+                url=cur.url,
+                type="youtube",
+                quality=cur.quality,
+                thumbnail_url=cur.thumbnail_url,
+                format=cur.format,
+                created_at=datetime.now().isoformat(),
+            ),
+        )
         t = asyncio.create_task(
             youtube_service.run_youtube_download(
                 new_id,
-                info["url"],
-                info["filename"],
-                info.get("format", "mp4"),
-                info.get("quality") or "1080",
-                info.get("thumbnail_url"),
+                cur.url,
+                cur.filename,
+                cur.format or "mp4",
+                cur.quality or "1080",
+                cur.thumbnail_url,
             )
         )
-        state.active_downloads[new_id] = t
+        tm.active_downloads[new_id] = t
     else:
-        state.task_credentials[new_id] = {"cookie": ck, "referer": rk}
-        state.tasks[new_id] = {
-            "task_id": new_id,
-            "status": "queued",
-            "progress": 0,
-            "filename": info["filename"],
-            "message": "Resuming...",
-            "url": info["url"],
-            "type": info.get("type", "hls"),
-            "thumbnail_url": info.get("thumbnail_url"),
-            "created_at": datetime.now().isoformat(),
-        }
+        await tm.register(
+            TaskState(
+                task_id=new_id,
+                status=TaskStatus.QUEUED,
+                progress=0.0,
+                filename=cur.filename,
+                message="Resuming...",
+                url=cur.url,
+                type=cur.type or "hls",
+                quality=cur.quality,
+                thumbnail_url=cur.thumbnail_url,
+                created_at=datetime.now().isoformat(),
+            ),
+            credentials={"cookie": ck, "referer": rk},
+        )
         t = asyncio.create_task(
             run_download(
                 new_id,
-                info["url"],
-                info["filename"],
-                info.get("thumbnail_url"),
-                info.get("quality"),
+                cur.url,
+                cur.filename,
+                cur.thumbnail_url,
+                cur.quality,
                 ck,
                 rk,
                 resolved_ips=resolved_ips,
             )
         )
-        state.active_downloads[new_id] = t
+        tm.active_downloads[new_id] = t
 
-    state.task_credentials.pop(task_id, None)
-    state.tasks.pop(task_id, None)
+    await tm.remove(task_id)
 
     logger.info("Task resumed: %s -> %s", task_id, new_id)
     return {"status": "resumed", "old_task_id": task_id, "new_task_id": new_id}
@@ -126,7 +132,7 @@ async def resume_task(task_id: str):
 @router.post("/tasks/stop-all")
 async def stop_all_tasks():
     stopped_count = 0
-    for tid in list(state.active_downloads.keys()):
+    for tid in list(tm.active_downloads.keys()):
         try:
             await stop_task(tid)
             stopped_count += 1
@@ -138,11 +144,11 @@ async def stop_all_tasks():
 
 @router.delete("/tasks/clear-stopped")
 async def clear_stopped_tasks():
-    cleared = []
-    for task_id in list(state.tasks.keys()):
-        if state.tasks[task_id].get("status") in ("stopped", "error", "completed"):
-            cleared.append(task_id)
-            del state.tasks[task_id]
-            state.task_credentials.pop(task_id, None)
-    logger.info("clear-stopped: %s tasks", len(cleared))
-    return {"status": "ok", "cleared_count": len(cleared)}
+    cleared = [
+        task_id
+        for task_id, t in tm.tasks.items()
+        if t.status in (TaskStatus.STOPPED, TaskStatus.ERROR, TaskStatus.COMPLETED)
+    ]
+    n = await tm.remove_many(cleared)
+    logger.info("clear-stopped: %s tasks", n)
+    return {"status": "ok", "cleared_count": n}

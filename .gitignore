@@ -6,6 +6,8 @@ temp/*
 !temp/.gitkeep
 __pycache__/
 *.spec.bak
+.coverage
+htmlcov/
 
 .env
 .DS_Store

@@ -9,9 +9,9 @@ from datetime import datetime
 from fastapi import APIRouter
 
 from app import config as cfg
-from app import state
-from app.models import DownloadRequest
+from app.models import DownloadRequest, TaskState, TaskStatus
 from app.services import download_service
+from app.state import tm
 from app.task_id import new_task_id
 from app.utils.filename import sanitize_filename_for_windows
 from app.utils.validation import validate_http_url
@@ -37,23 +37,21 @@ async def download(request: DownloadRequest):
     else:
         logger.info("NO thumbnail URL for: %s...", filename[:50])
 
-    state.task_credentials[task_id] = {
-        "cookie": request.cookie,
-        "referer": request.referer,
-    }
-
-    state.tasks[task_id] = {
-        "task_id": task_id,
-        "url": request.url,
-        "filename": filename,
-        "thumbnail_url": request.thumbnail_url,
-        "quality": request.quality,
-        "type": "hls",
-        "status": "queued",
-        "progress": 0,
-        "message": "Queue...",
-        "created_at": datetime.now().isoformat(),
-    }
+    await tm.register(
+        TaskState(
+            task_id=task_id,
+            url=request.url,
+            filename=filename,
+            thumbnail_url=request.thumbnail_url,
+            quality=request.quality,
+            type="hls",
+            status=TaskStatus.QUEUED,
+            progress=0.0,
+            message="Queue...",
+            created_at=datetime.now().isoformat(),
+        ),
+        credentials={"cookie": request.cookie, "referer": request.referer},
+    )
 
     task = asyncio.create_task(
         download_service.run_download(
@@ -67,6 +65,6 @@ async def download(request: DownloadRequest):
             resolved_ips=resolved_ips,
         )
     )
-    state.active_downloads[task_id] = task
+    tm.active_downloads[task_id] = task
 
     return {"task_id": task_id, "status": "queued", "filename": filename}

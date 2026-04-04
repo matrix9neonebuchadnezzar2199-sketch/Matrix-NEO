@@ -24,4 +24,4 @@ jobs:
           pip list
           python -c "from app.main import app; print('import OK')"
       - name: Pytest
-        run: python -m pytest -v --tb=long
+        run: python -m pytest -v --tb=long --cov=app --cov-report=term-missing
