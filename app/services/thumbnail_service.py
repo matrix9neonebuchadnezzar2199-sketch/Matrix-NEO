@@ -21,6 +21,7 @@ from app.utils.file_ops import replace_or_move_overwrite
 from app.utils.filename import is_ascii_basename
 from app.utils.process import stderr_tail, subprocess_exit_code
 from app.utils.paths import FFMPEG
+from app.utils.timeutil import utcnow_iso
 
 logger = logging.getLogger(__name__)
 
