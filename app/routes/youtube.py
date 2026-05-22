@@ -2,18 +2,15 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 
 from fastapi import APIRouter, HTTPException
 
 from app import config as cfg
-from app.models import TaskState, TaskStatus, YouTubeRequest
+from app.models import YouTubeRequest
 from app.services import youtube_service
-from app.state import tm
-from app.task_id import new_task_id
-from app.utils.timeutil import utcnow_iso
+from app.services.task_dispatch import queue_download_task
 from app.utils.validation import validate_http_url
 
 router = APIRouter(tags=["youtube"])
@@ -62,8 +59,7 @@ async def youtube_info(url: str):
 
 @router.post("/youtube/download")
 async def youtube_download(request: YouTubeRequest):
-    _url, _ = validate_http_url(request.url, block_private_ips=cfg.BLOCK_PRIVATE_IPS)
-    task_id = new_task_id()
+    validate_http_url(request.url, block_private_ips=cfg.BLOCK_PRIVATE_IPS)
     task_type = _detect_task_type(request.url)
 
     try:
@@ -76,32 +72,12 @@ async def youtube_download(request: YouTubeRequest):
         title = "video"
         thumbnail_url = ""
 
-    filename = request.filename or title
-    filename = re.sub(r'[<>:"/\\|?*]', "_", filename)[:80]
-    if request.format_type == "mp3":
-        filename += ".mp3"
-    else:
-        filename += ".mp4"
-
     ft = request.format_type or "mp4"
-    await tm.register(
-        TaskState(
-            task_id=task_id,
-            url=request.url,
-            filename=filename,
-            status=TaskStatus.QUEUED,
-            progress=0.0,
-            message="Queue...",
-            type=task_type,
-            format=ft,
-            quality=request.quality,
-            thumbnail_url=thumbnail_url if request.thumbnail else None,
-            created_at=utcnow_iso(),
-        ),
-    )
+    ext = ".mp3" if ft == "mp3" else ".mp4"
+    base_name = request.filename or title
 
-    task = asyncio.create_task(
-        youtube_service.run_youtube_download(
+    async def _runner(task_id: str, filename: str) -> None:
+        await youtube_service.run_youtube_download(
             task_id,
             request.url,
             filename,
@@ -109,14 +85,24 @@ async def youtube_download(request: YouTubeRequest):
             request.quality or "1080",
             thumbnail_url if request.thumbnail else None,
         )
+
+    payload = await queue_download_task(
+        url=request.url,
+        requested_filename=base_name,
+        task_type=task_type,
+        quality=request.quality,
+        thumbnail_url=thumbnail_url if request.thumbnail else None,
+        format_type=ft,
+        runner=_runner,
+        ext=ext,
     )
-    tm.active_downloads[task_id] = task
-
-    logger.info("yt-dlp queued [%s]: %s (%s, %s)", task_type, filename, ft, request.quality)
-
-    return {
-        "task_id": task_id,
-        "status": "queued",
-        "filename": filename,
-        "format": ft,
-    }
+    payload["format"] = ft
+    logger.info(
+        "yt-dlp queued [%s]: %s (%s, %s) dedup=%s",
+        task_type,
+        payload["filename"],
+        ft,
+        request.quality,
+        payload.get("deduplicated"),
+    )
+    return payload

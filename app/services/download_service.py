@@ -25,7 +25,6 @@ from app.constants import (
     PROGRESS_NORMALIZE,
     PROGRESS_THUMB_QUEUE,
     TERMINATE_WAIT_SEC,
-    THUMB_QUEUE_DELAY_SEC,
 )
 from app.models import TaskStatus
 from app.services import http_client
@@ -545,7 +544,6 @@ async def _finalize_with_optional_thumbnail(
     speed_mbps = size_mb / download_time if download_time > 0 else 0
     await tm.update(task_id, file_size=file_size)
     if thumbnail_url and tm.thumb_queue:
-        await asyncio.sleep(THUMB_QUEUE_DELAY_SEC)
         await tm.update(
             task_id,
             status=TaskStatus.THUMBNAIL,
@@ -657,21 +655,22 @@ async def run_download(
     resolved_ips: Optional[list[str]] = None,
 ) -> None:
     _ = request_quality
-    async with tm.semaphore:
-        wall_start = time.monotonic()
-        try:
-            # Disk space check before starting download
-            disk_ok, free_bytes = check_disk_space()
-            if not disk_ok:
-                free_mb = free_bytes / (1024 * 1024)
-                msg = f"Low disk space: {free_mb:.0f}MB free (need {cfg.MIN_FREE_DISK_MB}MB)"
-                await tm.update(task_id, status=TaskStatus.ERROR, message=msg)
-                logger.error("Disk space check failed: %s", msg)
-                return
-            filename = sanitize_filename_for_windows(filename)
-            await tm.update(task_id, filename=filename, status=TaskStatus.DOWNLOADING, message="Starting...")
-            output_path = cfg.OUTPUT_DIR / filename
+    wall_start = time.monotonic()
+    finalize_args: Optional[tuple] = None
+    try:
+        disk_ok, free_bytes = check_disk_space()
+        if not disk_ok:
+            free_mb = free_bytes / (1024 * 1024)
+            msg = f"Low disk space: {free_mb:.0f}MB free (need {cfg.MIN_FREE_DISK_MB}MB)"
+            await tm.update(task_id, status=TaskStatus.ERROR, message=msg)
+            logger.error("Disk space check failed: %s", msg)
+            return
 
+        filename = sanitize_filename_for_windows(filename)
+        await tm.update(task_id, filename=filename, status=TaskStatus.DOWNLOADING, message="Starting...")
+        output_path = cfg.OUTPUT_DIR / filename
+
+        async with tm.semaphore:
             if is_direct_progressive_http_url(url):
                 await tm.update(task_id, message="Downloading (HTTP)...")
                 raw = await _run_progressive(
@@ -679,69 +678,88 @@ async def run_download(
                 )
                 download_time = time.monotonic() - wall_start
                 if raw and raw.exists() and raw.stat().st_size >= MIN_VALID_FILE_BYTES:
-                    # _run_progressive may have already set ERROR on httpx failures; re-check task
                     t = tm.get(task_id)
-                    if t and t.status == TaskStatus.ERROR:
-                        return
-                    await _postprocess_and_finalize(
-                        task_id,
-                        filename,
-                        raw,
-                        output_path,
-                        thumbnail_url,
-                        cookie,
-                        referer,
-                        download_time=download_time,
-                        from_progressive=True,
-                    )
+                    if t and t.status != TaskStatus.ERROR:
+                        finalize_args = (
+                            task_id,
+                            filename,
+                            raw,
+                            output_path,
+                            thumbnail_url,
+                            cookie,
+                            referer,
+                            download_time,
+                            True,
+                        )
                 else:
                     t = tm.get(task_id)
                     if t and t.status != TaskStatus.ERROR:
                         await tm.update(task_id, status=TaskStatus.ERROR, message="Direct download failed")
                     logger.error("Direct download failed: %s", filename)
-                return
-
-            raw_result, killed_stall = await _run_m3u8(
-                task_id, url, filename, output_path, cookie, referer
-            )
-            download_time = time.monotonic() - wall_start
-
-            if raw_result and raw_result.exists() and raw_result.stat().st_size > MIN_VALID_FILE_BYTES:
-                await _postprocess_and_finalize(
-                    task_id,
-                    filename,
-                    raw_result,
-                    output_path,
-                    thumbnail_url,
-                    cookie,
-                    referer,
-                    download_time=download_time,
-                    from_progressive=False,
-                )
             else:
-                if killed_stall:
-                    await tm.update(
+                raw_result, killed_stall = await _run_m3u8(
+                    task_id, url, filename, output_path, cookie, referer
+                )
+                download_time = time.monotonic() - wall_start
+
+                if raw_result and raw_result.exists() and raw_result.stat().st_size > MIN_VALID_FILE_BYTES:
+                    finalize_args = (
                         task_id,
-                        status=TaskStatus.ERROR,
-                        message=(
-                            "Stalled (0 Bps). Set MATRIX_NEO_M3U8_MT=0 or increase "
-                            "MATRIX_NEO_M3U8_STALL_SEC"
-                        ),
+                        filename,
+                        raw_result,
+                        output_path,
+                        thumbnail_url,
+                        cookie,
+                        referer,
+                        download_time,
+                        False,
                     )
                 else:
-                    await tm.update(task_id, status=TaskStatus.ERROR, message="Download failed")
-                logger.error(
-                    "Failed: %s (raw=%s stall=%s)",
-                    filename,
-                    raw_result,
-                    killed_stall,
-                )
+                    if killed_stall:
+                        await tm.update(
+                            task_id,
+                            status=TaskStatus.ERROR,
+                            message=(
+                                "Stalled (0 Bps). Set MATRIX_NEO_M3U8_MT=0 or increase "
+                                "MATRIX_NEO_M3U8_STALL_SEC"
+                            ),
+                        )
+                    else:
+                        await tm.update(task_id, status=TaskStatus.ERROR, message="Download failed")
+                    logger.error(
+                        "Failed: %s (raw=%s stall=%s)",
+                        filename,
+                        raw_result,
+                        killed_stall,
+                    )
 
-        except asyncio.CancelledError:
-            await tm.update(task_id, status=TaskStatus.ERROR, message="Cancelled")
-            raise
-        except Exception as e:
-            await tm.update(task_id, status=TaskStatus.ERROR, message=str(e)[:MAX_ERROR_MSG_LEN])
-            logger.exception("run_download: %s", e)
-        finally:
-            tm.active_downloads.pop(task_id, None)
+        if finalize_args:
+            (
+                tid,
+                fname,
+                raw_path,
+                out_path,
+                thumb,
+                ck,
+                rk,
+                dl_time,
+                from_prog,
+            ) = finalize_args
+            await _postprocess_and_finalize(
+                tid,
+                fname,
+                raw_path,
+                out_path,
+                thumb,
+                ck,
+                rk,
+                download_time=dl_time,
+                from_progressive=from_prog,
+            )
+
+    except asyncio.CancelledError:
+        await tm.update(task_id, status=TaskStatus.ERROR, message="Cancelled")
+        raise
+    except Exception as e:
+        await tm.update(task_id, status=TaskStatus.ERROR, message=str(e)[:MAX_ERROR_MSG_LEN])
+        logger.exception("run_download: %s", e)

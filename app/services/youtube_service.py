@@ -267,5 +267,3 @@ async def run_youtube_download(
         except Exception as e:
             await tm.update(task_id, status=TaskStatus.ERROR, message=str(e)[:MAX_ERROR_MSG_LEN])
             logger.exception("YT error: %s", e)
-        finally:
-            tm.active_downloads.pop(task_id, None)

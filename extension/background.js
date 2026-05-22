@@ -139,12 +139,33 @@ const FALLBACK_AUDIO_QUALITIES = [
     { label: '128kbps', value: '128' },
 ];
 
+const MAX_ANALYZE_TABS = 2;
+
 class VideoDetector {
     constructor() {
         this.detectedVideos = new Map();
         this.processedUrls = new Map();
         this.MAX_VIDEOS = 50;
+        this._analyzeRunning = 0;
         this.init();
+    }
+
+    async _acquireAnalyzeSlot() {
+        while (this._analyzeRunning >= MAX_ANALYZE_TABS) {
+            await new Promise((resolve) => setTimeout(resolve, 400));
+        }
+        this._analyzeRunning += 1;
+    }
+
+    _releaseAnalyzeSlot() {
+        this._analyzeRunning = Math.max(0, this._analyzeRunning - 1);
+    }
+
+    _removeMatrixQueueItem(itemId) {
+        chrome.storage.local.get(['matrixQueue'], (result) => {
+            const q = (result.matrixQueue || []).filter((i) => i.id !== itemId);
+            chrome.storage.local.set({ matrixQueue: q });
+        });
     }
 
     init() {
@@ -948,6 +969,7 @@ class VideoDetector {
     }
 
     async analyzePageAndQueue(item) {
+        await this._acquireAnalyzeSlot();
         try {
             console.log('[MATRIX-M] Starting page analysis:', item.pageUrl);
             
@@ -999,16 +1021,22 @@ class VideoDetector {
 
             if (newVideo) {
                 console.log('[MATRIX-M] Video queued successfully:', newVideo.title);
-                
+                if (item.id) {
+                    this._removeMatrixQueueItem(item.id);
+                }
+
                 chrome.runtime.sendMessage({
                     type: 'VIDEO_DETECTED',
                     data: newVideo
                 }).catch(() => {});
-                
+
                 return;
             }
 
             console.log('[MATRIX-M] No video detected for:', item.pageUrl);
+            if (item.id) {
+                this._removeMatrixQueueItem(item.id);
+            }
             chrome.runtime.sendMessage({
                 type: 'QUEUE_FAILED',
                 data: { ...item, error: 'No video detected' }
@@ -1016,10 +1044,15 @@ class VideoDetector {
 
         } catch (error) {
             console.error('[MATRIX-M] Page analysis error:', error);
+            if (item.id) {
+                this._removeMatrixQueueItem(item.id);
+            }
             chrome.runtime.sendMessage({
                 type: 'QUEUE_FAILED',
                 data: { ...item, error: error.message }
             }).catch(() => {});
+        } finally {
+            this._releaseAnalyzeSlot();
         }
     }
 }

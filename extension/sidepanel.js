@@ -10,9 +10,49 @@ let downloadTasks = new Map();
 let selectedQualities = new Map();
 let savedList = [];
 let sseConnection = null;
-
+/** @type {Set<string>} keys currently submitting a download */
+const pendingDownloadKeys = new Set();
+let sequentialQueueRunning = false;
 
 // Utility functions are loaded from utils.js
+
+function videoListKey(video) {
+    if (!video || !video.url) return '';
+    return video.url.replace(/\/(1080p|720p|480p|360p|240p)\/video\.m3u8.*$/, '');
+}
+
+function isVideoDownloading(video) {
+    const vid = extractVideoIdFromUrl(video.pageUrl || video.url);
+    for (const task of downloadTasks.values()) {
+        if (!task.url) continue;
+        if (extractVideoIdFromUrl(task.url) === vid) return true;
+        if (task.url === video.url) return true;
+        if (video.qualities && video.qualities.some(function (q) { return q.url === task.url; })) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function mergeServerTasksFromApi(tasks) {
+    if (!tasks || !tasks.length) return false;
+    let changed = false;
+    const apiIds = new Set(tasks.map(function (t) { return t.task_id; }));
+    for (const task of tasks) {
+        const prev = downloadTasks.get(task.task_id);
+        if (!prev || prev.progress !== task.progress || prev.status !== task.status) {
+            changed = true;
+        }
+        downloadTasks.set(task.task_id, task);
+    }
+    for (const [tid] of downloadTasks) {
+        if (!apiIds.has(tid)) {
+            downloadTasks.delete(tid);
+            changed = true;
+        }
+    }
+    return changed;
+}
 
 async function resolvePageUrlForDownload(video) {
   if (video.pageUrl) return normalizeUrl(video.pageUrl);
@@ -232,6 +272,10 @@ async function init() {
             loadQueuedVideos();
             showQueueNotification(msg.data);
         }
+        if (msg.type === 'QUEUE_FAILED') {
+            alert('Queue failed: ' + (msg.data?.error || 'unknown'));
+            loadQueuedVideos();
+        }
         sendResponse({ok: true});
         return true;
     });
@@ -244,8 +288,8 @@ async function init() {
 
     // Use SSE for real-time task updates instead of 1s polling
     connectSSE();
-    // Fallback: poll tasks at a slower rate in case SSE disconnects
-    setInterval(loadServerTasks, 10000);
+    // Fallback: poll tasks slowly (SSE is primary)
+    setInterval(loadServerTasks, 30000);
     setInterval(loadVideos, 5000);
     setInterval(checkServer, 10000);
     setInterval(checkVpnStatus, 30000);
@@ -586,80 +630,55 @@ function updateSavedListDisplay() {
 async function loadServerTasks() {
     try {
         const res = await authFetch(serverUrl + '/tasks');
+        if (!res.ok) return;
         const data = await res.json();
-        if (data.tasks) {
-            const newTasks = new Map();
-            let changed = false;
-            const processedCompleted = new Set();
+        if (!data.tasks) return;
 
-            for (const task of data.tasks) {
-                if (task.status === 'completed' || task.status === 'error') {
-                    // Only process completed tasks once
-                    if (task.status === 'completed' && task.filename && !processedCompleted.has(task.task_id)) {
-                        if (!downloadTasks.has(task.task_id) || downloadTasks.get(task.task_id).status !== 'completed') {
-                            await addToSavedList(task.filename);
-                            await addToHistory(task);
-                            updateSavedListDisplay();
-                            processedCompleted.add(task.task_id);
-                            
-                            // Remove completed video from detected list
-                            removeCompletedFromQueue(task.filename, task.url);
-                        }
-                    }
-                    // Keep completed/error tasks visible (server GC handles cleanup)
-                    newTasks.set(task.task_id, task);
-                    const existingTask = downloadTasks.get(task.task_id);
-                    if (!existingTask || existingTask.status !== task.status) {
-                        changed = true;
-                    }
-                } else {
-                    newTasks.set(task.task_id, task);
-                    const existing = downloadTasks.get(task.task_id);
-                    if (!existing || existing.progress !== task.progress || existing.status !== task.status) {
-                        changed = true;
-                    }
+        const processedCompleted = new Set();
+        for (const task of data.tasks) {
+            if (task.status === 'completed' && task.filename && !processedCompleted.has(task.task_id)) {
+                if (!downloadTasks.has(task.task_id) || downloadTasks.get(task.task_id).status !== 'completed') {
+                    await addToSavedList(task.filename);
+                    await addToHistory(task);
+                    updateSavedListDisplay();
+                    processedCompleted.add(task.task_id);
+                    removeCompletedFromQueue(task.filename, task.url);
                 }
             }
-
-            if (downloadTasks.size !== newTasks.size) changed = true;
-            downloadTasks = newTasks;
-            if (changed) updateTasksOnly();
         }
-    } catch (e) {}
+        if (mergeServerTasksFromApi(data.tasks)) {
+            updateTasksOnly();
+        }
+    } catch (e) {
+        console.warn('[MATRIX-M] loadServerTasks:', e);
+    }
 }
 
 async function loadVideos() {
     try {
         const response = await chrome.runtime.sendMessage({ type: 'GET_VIDEOS' });
-        if (response && response.videos) {
-            const oldSize = detectedVideos.size;
-            
-            // Preserve queued items before clearing
-            const queuedItems = new Map();
-            for (const [key, video] of detectedVideos) {
-                if (video.isQueued) {
-                    queuedItems.set(key, video);
-                }
+        if (!response || !response.videos) return;
+
+        let changed = false;
+        for (const v of response.videos) {
+            const key = videoListKey(v);
+            const existing = detectedVideos.get(key);
+            if (!existing || (v.qualities?.length || 0) > (existing.qualities?.length || 0)) {
+                detectedVideos.set(key, v);
+                changed = true;
+            } else if (v.durationSec != null && (existing.durationSec == null || existing.durationSec <= 0)) {
+                existing.durationSec = v.durationSec;
+                detectedVideos.set(key, existing);
+                changed = true;
             }
-            
-            detectedVideos.clear();
-            
-            // Restore queued items
-            for (const [key, video] of queuedItems) {
-                detectedVideos.set(key, video);
-            }
-            
-            // Add detected videos
-            response.videos.forEach(v => {
-                const key = v.url.replace(/\/(1080p|720p|480p|360p)\/video\.m3u8.*$/, '');
-                if (!detectedVideos.has(key) || v.qualities?.length > detectedVideos.get(key).qualities?.length) {
-                    detectedVideos.set(key, v);
-                }
-            });
-            console.log('[MATRIX-M] loadVideos result:', response.videos?.length, 'videos from background');
-            renderVideosOnly(); // Always re-render after loadVideos
         }
-    } catch (e) {}
+        if (changed) {
+            console.log('[MATRIX-M] loadVideos merged:', response.videos.length);
+            renderVideosOnly();
+        }
+    } catch (e) {
+        console.warn('[MATRIX-M] loadVideos:', e);
+    }
 }
 
 function updateTasksOnly() {
@@ -706,7 +725,11 @@ function updateTasksOnly() {
         }
     });
     
+    const queuedCount = [...detectedVideos.values()].filter(function (v) { return v.isQueued; }).length;
     let header = '<div class="tasks-header"><span>DL(' + activeCount + ')</span><div>';
+    if (queuedCount > 0) {
+        header += '<button class="btn-sm" data-action="seq-queue">順次DL(' + queuedCount + ')</button>';
+    }
     if (completedCount > 0) header += '<button class="btn-sm btn-success" data-action="clear-completed">Clear Done (' + completedCount + ')</button>';
     if (activeCount > 0) header += '<button class="btn-sm btn-danger" data-action="stop-all">Stop All</button>';
     if (stoppedCount > 0) header += '<button class="btn-sm" data-action="clear-stopped">Clear</button>';
@@ -735,11 +758,7 @@ async function renderVideosOnly() {
         dlHistory = histResult.downloadHistory || [];
     } catch {}
     detectedVideos.forEach((video, key) => {
-        let isDownloading = false;
-        downloadTasks.forEach(task => {
-            if (task.url === video.url || (video.qualities && video.qualities.some(q => q.url === task.url))) isDownloading = true;
-        });
-        if (isDownloading) return;
+        if (isVideoDownloading(video) || pendingDownloadKeys.has(key)) return;
 
         const isSaved = isAlreadySaved(video.title);
         const dlDone = isDownloadedUrl(video.url, dlHistory);
@@ -838,6 +857,36 @@ function bindTaskEvents() {
     document.querySelectorAll('[data-action="delete"]').forEach(btn => {
         btn.onclick = function() { deleteTask(this.dataset.taskId); };
     });
+    document.querySelectorAll('[data-action="seq-queue"]').forEach(btn => {
+        btn.onclick = function() { startSequentialQueueDownloads(); };
+    });
+}
+
+async function startSequentialQueueDownloads() {
+    if (sequentialQueueRunning) return;
+    const entries = [...detectedVideos.entries()].filter(function (pair) { return pair[1].isQueued; });
+    if (entries.length === 0) return;
+    if (!confirm('キュー内 ' + entries.length + ' 件を順次ダウンロードしますか？')) return;
+
+    sequentialQueueRunning = true;
+    try {
+        for (const [, video] of entries) {
+            let dlUrl = video.url;
+            if (video.qualities && video.qualities.length > 0) {
+                dlUrl = video.qualities[0].url || video.qualities[0].value || video.url;
+            }
+            await startDownload(video, dlUrl);
+            while (true) {
+                const active = [...downloadTasks.values()].some(function (t) {
+                    return ['queued', 'downloading', 'merging', 'thumbnail'].includes(t.status);
+                });
+                if (!active && !isVideoDownloading(video)) break;
+                await new Promise(function (r) { setTimeout(r, 1500); });
+            }
+        }
+    } finally {
+        sequentialQueueRunning = false;
+    }
 }
 
 function updateEmptyMessage() {
@@ -855,24 +904,37 @@ function updateEmptyMessage() {
     }
 }
 
+function removeDetectedByVideo(video) {
+    for (const [k, v] of detectedVideos) {
+        if (v.id === video.id || v.url === video.url) {
+            detectedVideos.delete(k);
+            selectedQualities.delete(k);
+            pendingDownloadKeys.delete(k);
+            return k;
+        }
+    }
+    return null;
+}
+
 async function startDownload(video, url) {
+    const key = videoListKey(video);
+    if (pendingDownloadKeys.has(key) || isVideoDownloading(video)) {
+        return;
+    }
+    pendingDownloadKeys.add(key);
+    renderVideosOnly();
+
     try {
         const histCheck = await chrome.storage.local.get(['downloadHistory']);
         const hist = histCheck.downloadHistory || [];
         if (isDownloadedUrl(video.url, hist)) {
-            if (!confirm('この動画は既にDL済みです。再度ダウンロードしますか？')) return;
-        }
-        const filename = (video.title || 'video').replace(/[<>:"/\\|?*]/g, '_').substring(0, 80);
-
-        function removeDetectedByVideo() {
-            for (const [k, v] of detectedVideos) {
-                if (v.id === video.id) {
-                    detectedVideos.delete(k);
-                    selectedQualities.delete(k);
-                    return;
-                }
+            if (!confirm('この動画は既にDL済みです。再度ダウンロードしますか？')) {
+                return;
             }
         }
+        const filename = (video.title || 'video').replace(/[<>:"/\\|?*]/g, '_').substring(0, 80);
+        let endpoint = serverUrl + '/download';
+        let body;
 
         if (video.isYouTube || video.isYtDlp) {
             let qualityValue = '1080';
@@ -886,59 +948,55 @@ async function startDownload(video, url) {
                     } else if (selectedQ.value != null && selectedQ.value !== '') {
                         qualityValue = String(selectedQ.value);
                     } else if (selectedQ.label) {
-                        var numMatch = selectedQ.label.match(/(\d+)/);
+                        const numMatch = selectedQ.label.match(/(\d+)/);
                         if (numMatch) qualityValue = numMatch[1];
                     }
                 }
             }
-
-            const body = {
+            endpoint = serverUrl + '/youtube/download';
+            body = {
                 url: video.pageUrl || video.url,
                 filename: filename,
                 format_type: 'mp4',
                 quality: qualityValue,
                 thumbnail: true
             };
-
-            const res = await authFetch(serverUrl + '/youtube/download', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(body)
-            });
-            const data = await res.json();
-            if (data.task_id) {
-                removeDetectedByVideo();
-                chrome.runtime.sendMessage({ type: 'REMOVE_VIDEO_BY_URL', url: video.url });
-                await loadServerTasks();
-                renderVideosOnly();
+        } else {
+            body = { url: url, filename: filename + '.mp4', format_type: 'mp4' };
+            if (video.thumbnail) body.thumbnail_url = video.thumbnail;
+            const pageUrl = await resolvePageUrlForDownload(video);
+            if (pageUrl) {
+                const cookieHeader = await buildCookieHeaderForDownload(pageUrl);
+                if (cookieHeader) body.cookie = cookieHeader;
+                body.referer = pageUrl;
             }
-            return;
         }
 
-        const body = { url: url, filename: filename + '.mp4', format_type: 'mp4' };
-        if (video.thumbnail) body.thumbnail_url = video.thumbnail;
-
-        const pageUrl = await resolvePageUrlForDownload(video);
-        if (pageUrl) {
-            const cookieHeader = await buildCookieHeaderForDownload(pageUrl);
-            if (cookieHeader) body.cookie = cookieHeader;
-            body.referer = pageUrl;
-        }
-
-        const res = await authFetch(serverUrl + '/download', {
+        const res = await authFetch(endpoint, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body)
         });
-        const data = await res.json();
-        if (data.task_id) {
-            removeDetectedByVideo();
-            chrome.runtime.sendMessage({ type: 'REMOVE_VIDEO_BY_URL', url: video.url });
-            await loadServerTasks();
-            renderVideosOnly();
+        const data = await res.json().catch(function () { return {}; });
+        if (!res.ok) {
+            throw new Error(data.detail || ('HTTP ' + res.status));
+        }
+        if (!data.task_id) {
+            throw new Error('No task_id in response');
+        }
+
+        removeDetectedByVideo(video);
+        chrome.runtime.sendMessage({ type: 'REMOVE_VIDEO_BY_URL', url: video.url });
+        await loadServerTasks();
+        renderVideosOnly();
+        if (data.deduplicated) {
+            console.log('[MATRIX-M] Download already in flight:', data.task_id);
         }
     } catch (e) {
         alert('Error: ' + e.message);
+        renderVideosOnly();
+    } finally {
+        pendingDownloadKeys.delete(key);
     }
 }
 
@@ -1118,21 +1176,26 @@ async function clearStoppedTasks() {
     } catch (e) { alert('Error: ' + e.message); }
 }
 
+async function clearFinishedTasks() {
+    try {
+        await authFetch(serverUrl + '/tasks/clear-finished', { method: 'DELETE' });
+        await loadServerTasks();
+    } catch (e) { alert('Error: ' + e.message); }
+}
+
 async function clearCompletedTasks() {
+    await clearFinishedTasks();
     const completedIds = [];
     downloadTasks.forEach((task, taskId) => {
         if (task.status === 'completed' || task.status === 'error') {
             completedIds.push(taskId);
         }
     });
-    
     for (const taskId of completedIds) {
-        await authFetch(serverUrl + '/task/' + taskId, { method: 'DELETE' }).catch(() => {});
         downloadTasks.delete(taskId);
     }
-    
     updateTasksOnly();
-    console.log('[MATRIX-M] Cleared ' + completedIds.length + ' completed tasks');
+    console.log('[MATRIX-M] Cleared ' + completedIds.length + ' finished tasks');
 }
 
 async function deleteTask(taskId) {

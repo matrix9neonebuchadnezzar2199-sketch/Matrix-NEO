@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 
@@ -11,6 +12,7 @@ from app import config as cfg
 from app.models import TaskState, TaskStatus
 from app.services import youtube_service
 from app.services.download_service import run_download
+from app.services.task_dispatch import download_in_flight_key
 from app.state import tm
 from app.task_id import new_task_id
 from app.utils.timeutil import utcnow_iso
@@ -19,7 +21,6 @@ from app.utils.validation import validate_http_url
 router = APIRouter(tags=["tasks"])
 logger = logging.getLogger(__name__)
 
-# Task types handled by yt-dlp (YouTube, Dailymotion, other extractor sites)
 _YTDLP_TYPES = frozenset({"youtube", "yt-dlp"})
 
 
@@ -40,12 +41,15 @@ async def stop_task(task_id: str):
             logger.exception("stop_task await download")
     tm.active_downloads.pop(task_id, None)
 
-    partial = cfg.OUTPUT_DIR / task.filename
-    if partial.is_file():
+    out = cfg.OUTPUT_DIR / task.filename
+    part = Path(str(out) + ".part")
+    if out.is_file():
         try:
-            partial.unlink()
+            out.unlink()
         except OSError as e:
-            logger.debug("stop remove partial: %s", e)
+            logger.debug("stop remove output: %s", e)
+    if part.is_file():
+        logger.info("stop kept partial for resume: %s", part.name)
 
     await tm.update(
         task_id,
@@ -68,8 +72,24 @@ async def resume_task(task_id: str):
     cred = tm.task_credentials.get(task_id, {})
     ck, rk = cred.get("cookie"), cred.get("referer")
     new_id = new_task_id()
+    in_flight_key = download_in_flight_key(cur.url, cur.quality)
+    await tm.bind_in_flight(in_flight_key, new_id)
 
     if cur.type in _YTDLP_TYPES:
+
+        async def _run_yt() -> None:
+            try:
+                await youtube_service.run_youtube_download(
+                    new_id,
+                    cur.url,
+                    cur.filename,
+                    cur.format or "mp4",
+                    cur.quality or "1080",
+                    cur.thumbnail_url,
+                )
+            finally:
+                await tm.release_in_flight(in_flight_key, new_id)
+
         await tm.register(
             TaskState(
                 task_id=new_id,
@@ -85,18 +105,24 @@ async def resume_task(task_id: str):
                 created_at=utcnow_iso(),
             ),
         )
-        t = asyncio.create_task(
-            youtube_service.run_youtube_download(
-                new_id,
-                cur.url,
-                cur.filename,
-                cur.format or "mp4",
-                cur.quality or "1080",
-                cur.thumbnail_url,
-            )
-        )
-        tm.active_downloads[new_id] = t
+        t = asyncio.create_task(_run_yt())
     else:
+
+        async def _run_hls() -> None:
+            try:
+                await run_download(
+                    new_id,
+                    cur.url,
+                    cur.filename,
+                    cur.thumbnail_url,
+                    cur.quality,
+                    ck,
+                    rk,
+                    resolved_ips=resolved_ips,
+                )
+            finally:
+                await tm.release_in_flight(in_flight_key, new_id)
+
         await tm.register(
             TaskState(
                 task_id=new_id,
@@ -112,20 +138,9 @@ async def resume_task(task_id: str):
             ),
             credentials={"cookie": ck, "referer": rk},
         )
-        t = asyncio.create_task(
-            run_download(
-                new_id,
-                cur.url,
-                cur.filename,
-                cur.thumbnail_url,
-                cur.quality,
-                ck,
-                rk,
-                resolved_ips=resolved_ips,
-            )
-        )
-        tm.active_downloads[new_id] = t
+        t = asyncio.create_task(_run_hls())
 
+    tm.active_downloads[new_id] = t
     await tm.remove(task_id)
 
     logger.info("Task resumed: %s -> %s", task_id, new_id)
@@ -150,8 +165,20 @@ async def clear_stopped_tasks():
     cleared = [
         task_id
         for task_id, t in tm.tasks.items()
-        if t.status in (TaskStatus.STOPPED, TaskStatus.ERROR, TaskStatus.COMPLETED)
+        if t.status == TaskStatus.STOPPED
     ]
     n = await tm.remove_many(cleared)
     logger.info("clear-stopped: %s tasks", n)
+    return {"status": "ok", "cleared_count": n}
+
+
+@router.delete("/tasks/clear-finished")
+async def clear_finished_tasks():
+    cleared = [
+        task_id
+        for task_id, t in tm.tasks.items()
+        if t.status in (TaskStatus.COMPLETED, TaskStatus.ERROR)
+    ]
+    n = await tm.remove_many(cleared)
+    logger.info("clear-finished: %s tasks", n)
     return {"status": "ok", "cleared_count": n}

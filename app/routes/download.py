@@ -2,18 +2,14 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 
 from fastapi import APIRouter
 
 from app import config as cfg
-from app.models import DownloadRequest, TaskState, TaskStatus
+from app.models import DownloadRequest
 from app.services import download_service
-from app.state import tm
-from app.task_id import new_task_id
-from app.utils.filename import sanitize_filename_for_windows
-from app.utils.timeutil import utcnow_iso
+from app.services.task_dispatch import queue_download_task
 from app.utils.validation import validate_http_url
 
 router = APIRouter(tags=["download"])
@@ -26,33 +22,13 @@ async def download(request: DownloadRequest):
         request.url, block_private_ips=cfg.BLOCK_PRIVATE_IPS
     )
 
-    task_id = new_task_id()
-    filename = request.filename or f"video_{task_id}"
-    filename = sanitize_filename_for_windows(filename)
-
     if request.thumbnail_url:
-        logger.info("Thumbnail URL received for: %s...", filename[:50])
+        logger.info("Thumbnail URL received for: %s...", (request.filename or "")[:50])
     else:
-        logger.info("NO thumbnail URL for: %s...", filename[:50])
+        logger.info("NO thumbnail URL for: %s...", (request.filename or "")[:50])
 
-    await tm.register(
-        TaskState(
-            task_id=task_id,
-            url=request.url,
-            filename=filename,
-            thumbnail_url=request.thumbnail_url,
-            quality=request.quality,
-            type="hls",
-            status=TaskStatus.QUEUED,
-            progress=0.0,
-            message="Queue...",
-            created_at=utcnow_iso(),
-        ),
-        credentials={"cookie": request.cookie, "referer": request.referer},
-    )
-
-    task = asyncio.create_task(
-        download_service.run_download(
+    async def _runner(task_id: str, filename: str) -> None:
+        await download_service.run_download(
             task_id,
             validated_url,
             filename,
@@ -62,7 +38,13 @@ async def download(request: DownloadRequest):
             request.referer,
             resolved_ips=resolved_ips,
         )
-    )
-    tm.active_downloads[task_id] = task
 
-    return {"task_id": task_id, "status": "queued", "filename": filename}
+    return await queue_download_task(
+        url=request.url,
+        requested_filename=request.filename,
+        task_type="hls",
+        quality=request.quality,
+        thumbnail_url=request.thumbnail_url,
+        credentials={"cookie": request.cookie, "referer": request.referer},
+        runner=_runner,
+    )

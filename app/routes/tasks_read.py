@@ -16,7 +16,8 @@ logger = logging.getLogger(__name__)
 
 @router.get("/tasks")
 async def get_tasks():
-    return {"tasks": sanitize_tasks_list(tm.all_tasks())}
+    tasks = await tm.all_tasks_snapshot()
+    return {"tasks": sanitize_tasks_list(tasks)}
 
 
 @router.get("/status/{task_id}")

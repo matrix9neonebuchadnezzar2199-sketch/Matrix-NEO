@@ -18,11 +18,12 @@ from app.state import tm
 router = APIRouter(tags=["events"])
 
 
-def _task_snapshot() -> dict[str, tuple[str, float, str]]:
+async def _task_snapshot() -> dict[str, tuple[str, float, str]]:
     """Cheap per-task fingerprint: (status, progress_rounded, message)."""
+    tasks = await tm.all_tasks_snapshot()
     return {
         t.task_id: (t.status.value, round(t.progress, 2), t.message)
-        for t in tm.all_tasks()
+        for t in tasks
     }
 
 
@@ -33,7 +34,7 @@ async def task_events():
         tick = 0
         try:
             while True:
-                cur = _task_snapshot()
+                cur = await _task_snapshot()
 
                 # Detect changed or new tasks
                 changed_ids: list[str] = []

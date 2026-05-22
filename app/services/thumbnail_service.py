@@ -13,7 +13,7 @@ from typing import Dict, Optional
 import httpx
 
 from app import config as cfg
-from app.constants import PROGRESS_THUMB_DL, PROGRESS_THUMB_EMBED
+from app.constants import PROGRESS_THUMB_DL, PROGRESS_THUMB_EMBED, THUMB_QUEUE_DELAY_SEC
 from app.models import TaskStatus
 from app.services import http_client
 from app.state import tm
@@ -225,6 +225,8 @@ async def thumbnail_worker() -> None:
                 await asyncio.sleep(0.5)
                 continue
             job = await tm.thumb_queue.get()
+            if THUMB_QUEUE_DELAY_SEC > 0:
+                await asyncio.sleep(THUMB_QUEUE_DELAY_SEC)
             video_path = job["video_path"]
             thumb_url = job["thumb_url"]
             task_id = job["task_id"]

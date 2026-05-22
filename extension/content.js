@@ -115,8 +115,9 @@
     function addToQueue(url, title, thumbnail) {
         console.log('[MATRIX-M] addToQueue called:', { url, title, thumbnail });
         const item = {
-            id: Date.now().toString(),
+            id: Date.now().toString() + Math.random().toString(36).substr(2, 6),
             pageUrl: url,
+            url: url,
             title: title || 'Unknown Video',
             thumbnail: thumbnail || '',
             addedAt: new Date().toISOString(),
@@ -124,13 +125,20 @@
         };
 
         queue.push(item);
-        // updateQueueBadge();
-
-        // Send to background script for analysis
-        chrome.runtime.sendMessage({
-            type: 'ANALYZE_AND_QUEUE',
-            data: item
-        }).catch(() => {});
+        chrome.storage.local.get(['matrixQueue'], (result) => {
+            const stored = result.matrixQueue || [];
+            stored.push(item);
+            chrome.storage.local.set({ matrixQueue: stored }, () => {
+                chrome.runtime.sendMessage({
+                    type: 'ANALYZE_AND_QUEUE',
+                    data: item
+                }).catch(() => {});
+                chrome.runtime.sendMessage({
+                    type: 'QUEUE_UPDATED',
+                    data: item
+                }).catch(() => {});
+            });
+        });
     }
     
     function updateQueueBadge() {

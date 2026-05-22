@@ -9,6 +9,16 @@ from app import config as cfg
 from app.models import TaskState, TaskStatus
 
 
+_ACTIVE_STATUSES = frozenset(
+    {
+        TaskStatus.QUEUED,
+        TaskStatus.DOWNLOADING,
+        TaskStatus.MERGING,
+        TaskStatus.THUMBNAIL,
+    }
+)
+
+
 class TaskManager:
     """Central access point for all task state mutations."""
 
@@ -19,9 +29,14 @@ class TaskManager:
         self.semaphore = asyncio.Semaphore(cfg.MAX_CONCURRENT)
         self.thumb_queue: Optional[asyncio.Queue] = None
         self._lock = asyncio.Lock()
+        self._in_flight: dict[str, str] = {}
 
     def get(self, task_id: str) -> Optional[TaskState]:
         return self.tasks.get(task_id)
+
+    async def get_locked(self, task_id: str) -> Optional[TaskState]:
+        async with self._lock:
+            return self.tasks.get(task_id)
 
     def exists(self, task_id: str) -> bool:
         return task_id in self.tasks
@@ -29,8 +44,32 @@ class TaskManager:
     def all_tasks(self) -> list[TaskState]:
         return list(self.tasks.values())
 
+    async def all_tasks_snapshot(self) -> list[TaskState]:
+        async with self._lock:
+            return list(self.tasks.values())
+
     def tasks_by_status(self, status: TaskStatus) -> list[TaskState]:
         return [t for t in self.tasks.values() if t.status == status]
+
+    async def find_in_flight_task(self, key: str) -> Optional[TaskState]:
+        async with self._lock:
+            tid = self._in_flight.get(key)
+            if not tid:
+                return None
+            task = self.tasks.get(tid)
+            if task is None or task.status not in _ACTIVE_STATUSES:
+                self._in_flight.pop(key, None)
+                return None
+            return task
+
+    async def bind_in_flight(self, key: str, task_id: str) -> None:
+        async with self._lock:
+            self._in_flight[key] = task_id
+
+    async def release_in_flight(self, key: str, task_id: str) -> None:
+        async with self._lock:
+            if self._in_flight.get(key) == task_id:
+                self._in_flight.pop(key, None)
 
     async def register(
         self, task: TaskState, credentials: Optional[dict[str, str | None]] = None
@@ -69,6 +108,7 @@ class TaskManager:
         self.tasks.clear()
         self.active_downloads.clear()
         self.task_credentials.clear()
+        self._in_flight.clear()
 
 
 tm = TaskManager()

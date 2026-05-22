@@ -16,14 +16,23 @@ class MatrixM {
 
   async loadSettings() {
     try {
-      const result = await chrome.storage.local.get(['serverUrl']);
+      const result = await chrome.storage.local.get(['serverUrl', 'authToken']);
       if (result.serverUrl) {
         this.serverUrl = result.serverUrl;
         document.getElementById('serverUrl').value = this.serverUrl;
       }
+      this.authToken = result.authToken || '';
     } catch (e) {
       console.error('設定読み込みエラー:', e);
     }
+  }
+
+  authFetch(url, options = {}) {
+    if (this.authToken) {
+      options.headers = options.headers || {};
+      options.headers['Authorization'] = 'Bearer ' + this.authToken;
+    }
+    return fetch(url, options);
   }
 
   bindEvents() {
@@ -194,7 +203,7 @@ class MatrixM {
     progressContainer.style.display = 'block';
 
     try {
-      const response = await fetch(`${this.serverUrl}/download`, {
+      const response = await this.authFetch(`${this.serverUrl}/download`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -206,7 +215,7 @@ class MatrixM {
 
       const result = await response.json();
 
-      if (result.success) {
+      if (response.ok && result.task_id) {
         btn.innerHTML = '<span class="icon">✓</span> 開始しました';
         this.trackProgress(result.task_id, index);
       } else {
@@ -228,7 +237,7 @@ class MatrixM {
 
     const checkStatus = async () => {
       try {
-        const response = await fetch(`${this.serverUrl}/status/${taskId}`);
+        const response = await this.authFetch(`${this.serverUrl}/status/${taskId}`);
         const status = await response.json();
 
         progressFill.style.width = `${status.progress}%`;
@@ -241,7 +250,7 @@ class MatrixM {
           btn.innerHTML = '<span class="icon">✗</span> エラー';
           btn.disabled = false;
           progressText.textContent = 'エラー';
-          alert('ダウンロードエラー: ' + (status.error_message || '不明なエラー'));
+          alert('ダウンロードエラー: ' + (status.message || '不明なエラー'));
         } else {
           setTimeout(checkStatus, 1000);
         }
