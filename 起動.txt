@@ -1,15 +1,18 @@
-毎回の起動（PowerShell）
+■ サーバー URL（拡張の設定）
+  http://localhost:6850
+  （フォルダを移動してもポート 6850 ならこのままで OK）
 
-cd H:\TOOL\MATRIX-M\MATRIX-NEO
-.\.venv\Scripts\Activate.ps1
-python run_server.py
-venv をまだ作っていない場合は、その前に:
+■ 毎回の起動（おすすめ）
+  エクスプローラーでこのフォルダを開き、start_server_terminal.bat をダブルクリック
 
-cd H:\TOOL\MATRIX-M\MATRIX-NEO
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-止めるときは、そのウィンドウで Ctrl+C。
+■ PowerShell で起動
+  cd /d このフォルダのパス
+  .\.venv\Scripts\Activate.ps1
+  python run_server.py
 
-起動
-python run_server.py
+■ 拡張の「サーバー起動」ボタンを使う場合
+  フォルダを移したあとは、1 回だけ install-server-protocol.bat を実行
+  （旧 H:\TOOL\MATRIX-NEO のままだと「パスが見つかりません」になります）
+
+■ 止める
+  サーバーの黒い窓で Ctrl+C
