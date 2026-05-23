@@ -102,10 +102,11 @@ function fetchWithTimeout(url, options, timeoutMs) {
 function applyDirectThumbnails() {
     const container = document.getElementById('videoList');
     if (!container) return;
-    container.querySelectorAll('.videos-section img.thumb-proxied[data-thumb-url]').forEach(function (img) {
+    container.querySelectorAll('.videos-section img[data-thumb-url]').forEach(function (img) {
+        if (!img.classList.contains('thumb-direct') && !img.classList.contains('thumb-proxied')) return;
         if (img.src && (img.src.startsWith('blob:') || img.src.startsWith('http'))) return;
         const u = img.getAttribute('data-thumb-url');
-        if (u) img.src = u;
+        if (u && img.classList.contains('thumb-direct')) img.src = u;
     });
 }
 
@@ -901,7 +902,10 @@ async function renderVideosOnly() {
         html += '<div class="video-card detected' + (isSaved ? ' saved' : '') + (dlDone ? ' is-downloaded' : '') + hasThumbnail + '" data-key="' + encodeURIComponent(key) + '">';
 
         if (video.thumbnail) {
-            html += '<div class="video-thumb"><img class="thumb-proxied" data-thumb-url="' + escapeHtml(video.thumbnail) + '" alt=""></div>';
+            const thumbClass = /img\.supjav\.com\/images\//i.test(video.thumbnail)
+                ? 'thumb-direct'
+                : 'thumb-proxied';
+            html += '<div class="video-thumb"><img class="' + thumbClass + '" data-thumb-url="' + escapeHtml(video.thumbnail) + '" alt=""></div>';
         }
 
         html += '<div class="video-info">';
@@ -921,7 +925,8 @@ async function renderVideosOnly() {
     videosContainer.innerHTML = html;
     bindVideoEvents();
     updateEmptyMessage();
-    loadProxiedThumbnails().catch(() => {});
+    applyDirectThumbnails();
+    loadProxiedThumbnails().catch(function () {});
 }
 
 function bindVideoEvents() {

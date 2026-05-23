@@ -189,6 +189,7 @@ class VideoDetector {
                 this.checkForYouTube(tabId, tab.url, tab.title);
                 this.checkForYtDlpSite(tabId, tab.url, tab.title);
                 this.scheduleScanProgressiveFromDom(tabId, tab.url);
+                this.scheduleSupjavFrameInject(tabId, tab.url);
             }
             if (changeInfo.status === 'loading' && changeInfo.url) {
                 this.clearTabVideos(tabId);
@@ -362,6 +363,25 @@ class VideoDetector {
     /**
      * webRequest が拾えない場合（キャッシュ・タイミング等）に <video src> から検出
      */
+    scheduleSupjavFrameInject(tabId, pageUrl) {
+        if (!pageUrl || !/supjav\.com\/ja\/\d+\.html/i.test(pageUrl)) return;
+        const delays = [0, 2000, 6000, 12000, 20000];
+        for (const ms of delays) {
+            setTimeout(() => this.injectStreamFrameScanner(tabId), ms);
+        }
+    }
+
+    async injectStreamFrameScanner(tabId) {
+        try {
+            await chrome.scripting.executeScript({
+                target: { tabId, allFrames: true },
+                files: ['stream_frame_scanner.js'],
+            });
+        } catch (e) {
+            console.log('[MATRIX-M] frame scanner inject:', e.message);
+        }
+    }
+
     scheduleScanProgressiveFromDom(tabId, pageUrl) {
         if (!pageUrl || !/^https?:/i.test(pageUrl)) return;
         if (/youtube\.com|youtu\.be/i.test(pageUrl)) return;
@@ -422,7 +442,10 @@ class VideoDetector {
         if (url.startsWith('blob:')) return;
 
         const urlLower = url.toLowerCase();
-        let isHls = urlLower.includes('.m3u8') || /\/hls\//i.test(url);
+        let isHls =
+            urlLower.includes('.m3u8') ||
+            /\/hls\//i.test(url) ||
+            /\/(?:playlist|manifest|index)(?:\.m3u8)?(?:\?|$)/i.test(url);
         let isDash = urlLower.includes('.mpd');
         let isProg = this.isProgressiveFileUrl(url);
 
@@ -475,7 +498,9 @@ class VideoDetector {
         }
         tabUrls.add(url);
 
-        const isMaster = /\/playlist\.m3u8|\/master\.m3u8|\/index\.m3u8/i.test(url);
+        const isMaster =
+            /\/playlist\.m3u8|\/master\.m3u8|\/index\.m3u8|\/manifest\.m3u8/i.test(url) ||
+            (isHls && /\.m3u8/i.test(url) && !/\/\d+\.ts(\?|$)/i.test(url));
         const isQualityVariant = /\/(1080p|720p|480p|360p|240p)\/video\.m3u8/i.test(url);
 
         if (isHls && isQualityVariant && !isMaster) {
@@ -938,29 +963,33 @@ class VideoDetector {
 
             case 'STREAM_URL_FOUND': {
                 const tabId = sender.tab && sender.tab.id >= 0 ? sender.tab.id : null;
-                if (tabId == null) {
+                if (tabId == null || !message.url) {
                     sendResponse({ success: false });
                     break;
                 }
                 const streamUrl = message.url;
-                if (!streamUrl) {
-                    sendResponse({ success: false });
-                    break;
-                }
                 const tabUrls = this.getTabProcessedUrls(tabId);
                 if (tabUrls.has(streamUrl)) {
                     sendResponse({ success: true, duplicate: true });
                     break;
                 }
                 tabUrls.add(streamUrl);
-                console.log('[MATRIX-M] Stream from page script:', streamUrl.substring(0, 80));
-                this.processVideo(streamUrl, tabId, true, {
+                const self = this;
+                const hints = {
                     title: message.title,
                     thumbnail: message.thumbnail,
                     pageUrl: message.pageUrl,
+                };
+                chrome.tabs.get(tabId, (tab) => {
+                    if (tab && tab.url && /supjav\.com\/ja\/\d+\.html/i.test(tab.url)) {
+                        hints.pageUrl = tab.url;
+                        if (!hints.title && tab.title) hints.title = tab.title;
+                    }
+                    console.log('[MATRIX-M] Stream from frame:', streamUrl.substring(0, 80));
+                    self.processVideo(streamUrl, tabId, true, hints);
+                    sendResponse({ success: true });
                 });
-                sendResponse({ success: true });
-                break;
+                return true;
             }
 
             case 'ANALYZE_AND_QUEUE':
