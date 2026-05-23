@@ -4,6 +4,8 @@
 
 ■ 毎回の起動（おすすめ）
   エクスプローラーでこのフォルダを開き、start_server_terminal.bat をダブルクリック
+  ※「ポートが使用中」＝ 既にサーバーが動いています。拡張は Online のまま使えます。
+  ※再起動したいときは stop_server.bat → から start_server_terminal.bat
 
 ■ PowerShell で起動
   cd /d このフォルダのパス
