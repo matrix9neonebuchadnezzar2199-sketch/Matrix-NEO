@@ -422,9 +422,22 @@ class VideoDetector {
         if (url.startsWith('blob:')) return;
 
         const urlLower = url.toLowerCase();
-        const isHls = urlLower.includes('.m3u8');
-        const isDash = urlLower.includes('.mpd');
-        const isProg = this.isProgressiveFileUrl(url);
+        let isHls = urlLower.includes('.m3u8') || /\/hls\//i.test(url);
+        let isDash = urlLower.includes('.mpd');
+        let isProg = this.isProgressiveFileUrl(url);
+
+        if (!isHls && !isDash && !isProg) {
+            const headers = details.responseHeaders || [];
+            const ctHeader = headers.find((x) => x.name && x.name.toLowerCase() === 'content-type');
+            const ct = ctHeader ? String(ctHeader.value || '').toLowerCase() : '';
+            if (/mpegurl|x-mpegurl|vnd\.apple\.mpegurl/.test(ct)) {
+                isHls = true;
+            } else if (/dash\+xml/.test(ct)) {
+                isDash = true;
+            } else if (!isProg && /video\/(mp4|webm|mpeg)/.test(ct)) {
+                isProg = true;
+            }
+        }
 
         if (!isHls && !isDash && !isProg) return;
 
@@ -478,7 +491,8 @@ class VideoDetector {
         this.processVideo(url, tabId, isMaster);
     }
 
-    async processVideo(url, tabId, isMaster) {
+    async processVideo(url, tabId, isMaster, hints) {
+        hints = hints || {};
         try {
             let qualities = [];
             let durationSec = null;
@@ -491,19 +505,20 @@ class VideoDetector {
                 qualities = mpdData.qualities;
             }
 
-            let title = 'Unknown Video';
-            let thumbnail = null;
+            let title = hints.title || 'Unknown Video';
+            let thumbnail = hints.thumbnail || null;
             let isUncensored = false;
 
-            let pageUrl = null;
+            let pageUrl = hints.pageUrl || null;
             try {
                 const tab = await chrome.tabs.get(tabId);
-                if (tab && tab.url && /^https?:/i.test(tab.url)) {
+                if (!pageUrl && tab && tab.url && /^https?:/i.test(tab.url)) {
                     pageUrl = tab.url;
                 }
-                if (tab && tab.title) {
+                if (!hints.title && tab && tab.title) {
                     title = tab.title
                         .replace(/\s*[-|]\s*MissAV.*$/i, '')
+                        .replace(/\s*[-|]\s*Supjav.*$/i, '')
                         .replace(/\s*[-|]\s*[^-|]{0,15}$/g, '')
                         .trim();
                 }
@@ -918,6 +933,33 @@ class VideoDetector {
                 }
                 this.updateBadge();
                 sendResponse({ success: true, removed: removed });
+                break;
+            }
+
+            case 'STREAM_URL_FOUND': {
+                const tabId = sender.tab && sender.tab.id >= 0 ? sender.tab.id : null;
+                if (tabId == null) {
+                    sendResponse({ success: false });
+                    break;
+                }
+                const streamUrl = message.url;
+                if (!streamUrl) {
+                    sendResponse({ success: false });
+                    break;
+                }
+                const tabUrls = this.getTabProcessedUrls(tabId);
+                if (tabUrls.has(streamUrl)) {
+                    sendResponse({ success: true, duplicate: true });
+                    break;
+                }
+                tabUrls.add(streamUrl);
+                console.log('[MATRIX-M] Stream from page script:', streamUrl.substring(0, 80));
+                this.processVideo(streamUrl, tabId, true, {
+                    title: message.title,
+                    thumbnail: message.thumbnail,
+                    pageUrl: message.pageUrl,
+                });
+                sendResponse({ success: true });
                 break;
             }
 

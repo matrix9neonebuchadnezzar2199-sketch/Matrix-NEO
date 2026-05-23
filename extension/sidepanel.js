@@ -916,6 +916,13 @@ function removeDetectedByVideo(video) {
     return null;
 }
 
+function isLikelyStreamUrl(u) {
+    if (!u || !/^https?:\/\//i.test(u)) return false;
+    if (/\.html?(\?|#|$)/i.test(u)) return false;
+    if (/supjav\.com\/ja\/\d+\.html/i.test(u)) return false;
+    return /\.m3u8|\.mpd|\.mp4|\.webm|\.m4v|\/hls\/|\/stream\//i.test(u);
+}
+
 async function startDownload(video, url) {
     const key = videoListKey(video);
     if (pendingDownloadKeys.has(key) || isVideoDownloading(video)) {
@@ -925,6 +932,13 @@ async function startDownload(video, url) {
     renderVideosOnly();
 
     try {
+        if (!video.isYouTube && !video.isYtDlp && !isLikelyStreamUrl(url)) {
+            alert(
+                'ストリームURLが検出されていません。\n' +
+                '動画ページで再生ボタンを押し、サイドパネルに HLS/MP4 が表示されてから DL してください。'
+            );
+            return;
+        }
         const histCheck = await chrome.storage.local.get(['downloadHistory']);
         const hist = histCheck.downloadHistory || [];
         if (isDownloadedUrl(video.url, hist)) {
@@ -1296,18 +1310,30 @@ document.getElementById('analyzeBtn').onclick = async function() {
                 });
                 result += '\n';
 
-                // 7. Streaming URLs in page
+                // 7. Streaming URLs in page (+ script tags — supjav etc.)
                 result += '--- STREAMING URLs (in page source) ---\n';
-                const pageText = document.body?.innerHTML || '';
+                let pageText = document.body?.innerHTML || '';
+                document.querySelectorAll('script').forEach(function (s) {
+                    pageText += s.textContent || '';
+                });
+                document.querySelectorAll('iframe[src]').forEach(function (f) {
+                    pageText += ' ' + f.src + ' ';
+                });
                 const m3u8Match = pageText.match(/https?:\/\/[^"'\s<>]+\.m3u8[^"'\s<>]*/g);
                 const mpdMatch = pageText.match(/https?:\/\/[^"'\s<>]+\.mpd[^"'\s<>]*/g);
+                const hlsPathMatch = pageText.match(/https?:\/\/[^"'\s<>]*\/hls\/[^"'\s<>]*/g);
                 if (m3u8Match) {
                     result += 'm3u8 URLs (' + m3u8Match.length + '):\n';
                     [...new Set(m3u8Match)].slice(0, 5).forEach(url => {
                         result += '  ' + url.substring(0, 80) + '\n';
                     });
+                } else if (hlsPathMatch && hlsPathMatch.length) {
+                    result += 'hls path URLs (' + hlsPathMatch.length + '):\n';
+                    [...new Set(hlsPathMatch)].slice(0, 5).forEach(function (u) {
+                        result += '  ' + u.substring(0, 80) + '\n';
+                    });
                 } else {
-                    result += 'm3u8 URLs: None found\n';
+                    result += 'm3u8 URLs: None found (再生後に再分析してください)\n';
                 }
                 if (mpdMatch) {
                     result += 'mpd URLs (' + mpdMatch.length + '):\n';

@@ -63,6 +63,14 @@
 | 拡張 | `popup.js` — `task_id` 応答・Bearer 対応 |
 | 拡張 | `clearCompletedTasks` → `/tasks/clear-finished` |
 
+### 追記 — supjav.com 対応 (2026-05-23)
+
+- `extension/supjav_watch.js` — 再生ページの script/DOM から m3u8 を抽出
+- `background.js` — Content-Type による HLS 検出、`STREAM_URL_FOUND` ハンドラ
+- `sidepanel.js` — ページ URL への誤 DL 防止、分析器の script 走査
+
+---
+
 ### 残タスク（意図的に後回し）
 
 - yt-dlp 経路の HLS 同等サムネキュー
