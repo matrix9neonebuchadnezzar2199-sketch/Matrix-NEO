@@ -13,6 +13,13 @@ let sseConnection = null;
 /** @type {Set<string>} keys currently submitting a download */
 const pendingDownloadKeys = new Set();
 let sequentialQueueRunning = false;
+let serverReachable = false;
+let serverWasReachable = false;
+let thumbProxyInFlight = false;
+let thumbProxyQueued = false;
+let thumbProxyWarnedOffline = false;
+const THUMB_PROXY_CONCURRENCY = 2;
+const FETCH_TIMEOUT_MS = 12000;
 
 // Utility functions are loaded from utils.js
 
@@ -83,61 +90,125 @@ function buildCookieHeaderForDownload(pageUrl) {
   });
 }
 
-/** CDN が <img> 直リンクを弾くため、サーバーが Cookie/Referer 付きで取得した画像を blob で表示する */
+function fetchWithTimeout(url, options, timeoutMs) {
+    const ms = timeoutMs || FETCH_TIMEOUT_MS;
+    const controller = new AbortController();
+    const timer = setTimeout(function () { controller.abort(); }, ms);
+    const opts = Object.assign({}, options || {}, { signal: controller.signal });
+    return fetch(url, opts).finally(function () { clearTimeout(timer); });
+}
+
+/** サーバー Offline 時は CDN 直リンクを試す（プロキシ不要なホスト向け） */
+function applyDirectThumbnails() {
+    const container = document.getElementById('videoList');
+    if (!container) return;
+    container.querySelectorAll('.videos-section img.thumb-proxied[data-thumb-url]').forEach(function (img) {
+        if (img.src && (img.src.startsWith('blob:') || img.src.startsWith('http'))) return;
+        const u = img.getAttribute('data-thumb-url');
+        if (u) img.src = u;
+    });
+}
+
+async function proxyOneThumbnail(img, base) {
+    const thumbUrl = img.getAttribute('data-thumb-url');
+    const card = img.closest('.video-card');
+    if (!card || !thumbUrl) return;
+    const key = decodeURIComponent(card.dataset.key);
+    const video = detectedVideos.get(key);
+    if (!video) return;
+
+    const pageUrl = await resolvePageUrlForDownload(video);
+    const cookie = await buildCookieHeaderForDownload(pageUrl);
+    const res = await authFetch(base + '/proxy-image', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            url: thumbUrl,
+            cookie: cookie || undefined,
+            referer: pageUrl || undefined
+        })
+    });
+    if (!res.ok) {
+        if (thumbUrl) img.src = thumbUrl;
+        return;
+    }
+    const blob = await res.blob();
+    const prev = img.src && img.src.startsWith('blob:') ? img.src : null;
+    img.src = URL.createObjectURL(blob);
+    if (prev) URL.revokeObjectURL(prev);
+}
+
+/** CDN が <img> 直リンクを弾くため、サーバーが Cookie/Referer 付きで取得（サーバー Offline 時は直リンク） */
 async function loadProxiedThumbnails() {
     const container = document.getElementById('videoList');
     if (!container) return;
-    const base = serverUrl.replace(/\/$/, '');
-    const imgs = container.querySelectorAll('.videos-section img.thumb-proxied[data-thumb-url]');
-    for (const img of imgs) {
-        if (img.src && img.src.startsWith('blob:')) continue;
 
-        const thumbUrl = img.getAttribute('data-thumb-url');
-        const card = img.closest('.video-card');
-        if (!card || !thumbUrl) continue;
-        const key = decodeURIComponent(card.dataset.key);
-        const video = detectedVideos.get(key);
-        if (!video) continue;
-        try {
-            const pageUrl = await resolvePageUrlForDownload(video);
-            const cookie = await buildCookieHeaderForDownload(pageUrl);
-            const res = await authFetch(base + '/proxy-image', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    url: thumbUrl,
-                    cookie: cookie || undefined,
-                    referer: pageUrl || undefined
-                })
-            });
-            if (!res.ok) {
-                console.warn('[THUMB] proxy HTTP', res.status);
-                continue;
-            }
-            const blob = await res.blob();
-            const prev = img.src && img.src.startsWith('blob:') ? img.src : null;
-            img.src = URL.createObjectURL(blob);
-            if (prev) URL.revokeObjectURL(prev);
-        } catch (e) {
-            console.warn('[THUMB] proxy failed', e);
+    if (!serverReachable) {
+        applyDirectThumbnails();
+        if (!thumbProxyWarnedOffline) {
+            thumbProxyWarnedOffline = true;
+            console.log('[THUMB] Server offline — using direct thumbnail URLs');
+        }
+        return;
+    }
+    thumbProxyWarnedOffline = false;
+
+    if (thumbProxyInFlight) {
+        thumbProxyQueued = true;
+        return;
+    }
+    thumbProxyInFlight = true;
+
+    const base = serverUrl.replace(/\/$/, '');
+    const imgs = Array.from(container.querySelectorAll('.videos-section img.thumb-proxied[data-thumb-url]'))
+        .filter(function (img) { return !(img.src && img.src.startsWith('blob:')); });
+
+    try {
+        for (let i = 0; i < imgs.length; i += THUMB_PROXY_CONCURRENCY) {
+            const batch = imgs.slice(i, i + THUMB_PROXY_CONCURRENCY);
+            await Promise.all(batch.map(async function (img) {
+                try {
+                    await proxyOneThumbnail(img, base);
+                } catch (e) {
+                    const fallback = img.getAttribute('data-thumb-url');
+                    if (fallback) img.src = fallback;
+                }
+            }));
+        }
+    } finally {
+        thumbProxyInFlight = false;
+        if (thumbProxyQueued) {
+            thumbProxyQueued = false;
+            loadProxiedThumbnails().catch(function () {});
         }
     }
 }
 
-
-/** Fetch wrapper that adds Bearer auth header when token is configured. */
-function authFetch(url, options = {}) {
+/** Fetch wrapper: Bearer + timeout; skips when server is offline (except /health). */
+function authFetch(url, options) {
+    options = options || {};
+    const isHealth = String(url).indexOf('/health') !== -1;
+    if (!serverReachable && !isHealth) {
+        return Promise.reject(new TypeError('Server offline'));
+    }
     if (authToken) {
         options.headers = options.headers || {};
         if (typeof options.headers === 'object' && !(options.headers instanceof Headers)) {
             options.headers['Authorization'] = 'Bearer ' + authToken;
         }
     }
-    return fetch(url, options);
+    return fetchWithTimeout(url, options, FETCH_TIMEOUT_MS);
 }
 
 // === SSE Connection for real-time task updates ===
 function connectSSE() {
+    if (!serverReachable) {
+        if (sseConnection) {
+            sseConnection.close();
+            sseConnection = null;
+        }
+        return;
+    }
     if (sseConnection) {
         sseConnection.close();
         sseConnection = null;
@@ -248,8 +319,10 @@ async function init() {
         if (tokenInput) authToken = tokenInput.value.trim();
         await chrome.storage.local.set({ serverUrl, authToken });
         document.getElementById('settingsModal').classList.remove('show');
-        // Reconnect SSE with new settings
-        connectSSE();
+        serverWasReachable = false;
+        checkServer().then(function (ok) {
+            if (ok) connectSSE();
+        });
     };
 
     document.getElementById('testConnection').onclick = async () => {
@@ -280,14 +353,14 @@ async function init() {
         return true;
     });
 
-    await loadServerTasks();
+    await checkServer();
+    if (serverReachable) {
+        await loadServerTasks();
+        connectSSE();
+    }
     await loadVideos();
     await loadQueuedVideos();
-    checkServer();
     checkVpnStatus();
-
-    // Use SSE for real-time task updates instead of 1s polling
-    connectSSE();
     // Fallback: poll tasks slowly (SSE is primary)
     setInterval(loadServerTasks, 30000);
     setInterval(loadVideos, 5000);
@@ -297,22 +370,54 @@ async function init() {
 
 async function checkServer() {
     const el = document.getElementById('serverStatus');
-    try {
-        const res = await fetch(serverUrl + '/health');
-        await res.json();
-        el.textContent = res.ok ? 'Online' : 'Error';
-        el.className = 'status ' + (res.ok ? 'online' : 'offline');
-    } catch (e) {
-        el.textContent = 'Offline';
-        el.className = 'status offline';
+    const base = (serverUrl || '').replace(/\/$/, '');
+    if (!base) {
+        serverReachable = false;
+        if (el) {
+            el.textContent = 'Offline';
+            el.className = 'status offline';
+        }
+        return false;
     }
+    try {
+        const res = await fetchWithTimeout(base + '/health', {}, 5000);
+        await res.json();
+        serverReachable = res.ok;
+        if (el) {
+            el.textContent = res.ok ? 'Online' : 'Error';
+            el.className = 'status ' + (res.ok ? 'online' : 'offline');
+        }
+    } catch (e) {
+        serverReachable = false;
+        if (el) {
+            el.textContent = 'Offline';
+            el.className = 'status offline';
+        }
+    }
+
+    if (serverReachable && !serverWasReachable) {
+        connectSSE();
+        loadServerTasks().catch(function () {});
+    } else if (!serverReachable && serverWasReachable) {
+        if (sseConnection) {
+            sseConnection.close();
+            sseConnection = null;
+        }
+    }
+    serverWasReachable = serverReachable;
+    return serverReachable;
 }
 
 
 async function checkVpnStatus() {
     const el = document.getElementById('vpnStatus');
     if (!el) return;
-    
+    if (!serverReachable) {
+        el.textContent = 'VPN: Offline';
+        el.className = 'vpn-status error';
+        return;
+    }
+
     try {
         const res = await authFetch(serverUrl + '/vpn-status');
         const data = await res.json();
@@ -628,6 +733,7 @@ function updateSavedListDisplay() {
 }
 
 async function loadServerTasks() {
+    if (!serverReachable) return;
     try {
         const res = await authFetch(serverUrl + '/tasks');
         if (!res.ok) return;
@@ -650,7 +756,9 @@ async function loadServerTasks() {
             updateTasksOnly();
         }
     } catch (e) {
-        console.warn('[MATRIX-M] loadServerTasks:', e);
+        if (serverReachable) {
+            console.warn('[MATRIX-M] loadServerTasks:', e);
+        }
     }
 }
 

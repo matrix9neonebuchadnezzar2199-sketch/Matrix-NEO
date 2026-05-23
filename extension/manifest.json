@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "MATRIX-NEO_v2.0",
-  "version": "2.1.1",
+  "version": "2.1.2",
   "description": "M3U8/MPD/MP4/WebM 動画を検出してダウンロード",
 
   "permissions": [
