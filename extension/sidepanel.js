@@ -238,12 +238,15 @@ async function loadProxiedThumbnails() {
     }
 }
 
-/** Fetch wrapper: Bearer + background proxy; skips when server is offline (except /health). */
+/** Fetch wrapper: Bearer + background proxy; re-probes /health if flag is stale. */
 function authFetch(url, options) {
     options = options || {};
     const isHealth = String(url).indexOf('/health') !== -1;
     if (!serverReachable && !isHealth) {
-        return Promise.reject(new TypeError('Server offline'));
+        return checkServer().then(function (ok) {
+            if (!ok) return Promise.reject(new TypeError('Server offline'));
+            return authFetch(url, options);
+        });
     }
     options.headers = options.headers || {};
     if (typeof options.headers === 'object' && !(options.headers instanceof Headers)) {
@@ -463,8 +466,8 @@ async function checkServer() {
         const resp = await bgServerFetch(base + '/health', {}, 'text');
         serverReachable = resp.status === 200;
         if (el) {
-            el.textContent = res.ok ? 'Online' : 'Error';
-            el.className = 'status ' + (res.ok ? 'online' : 'offline');
+            el.textContent = serverReachable ? 'Online' : 'Error';
+            el.className = 'status ' + (serverReachable ? 'online' : 'offline');
         }
     } catch (e) {
         serverReachable = false;
