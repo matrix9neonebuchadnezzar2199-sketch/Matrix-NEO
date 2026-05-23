@@ -326,14 +326,35 @@ async function init() {
         if (result.authToken) authToken = result.authToken;
     } catch (e) {}
 
-    document.getElementById('startServerBtn').onclick = () => {
+    document.getElementById('startServerBtn').onclick = async () => {
+        const base = normalizeServerUrl(serverUrl);
+        try {
+            const resp = await bgServerFetch(base + '/health', {}, 'text');
+            if (resp.ok) {
+                alert('サーバーは既に起動しています。\n' + base);
+                return;
+            }
+        } catch (_) {}
+
         chrome.tabs.create({ url: MATRIX_NEO_SERVER_LAUNCH_URL, active: false }, () => {
             if (chrome.runtime.lastError) {
                 alert(
                     'サーバー起動用リンクを開けませんでした: ' + chrome.runtime.lastError.message +
-                    '\n\nフォルダ移動後は install-server-protocol.bat を1回実行してください。'
+                    '\n\nプロジェクト直下の install-server-protocol.bat を1回実行してください。'
                 );
+                return;
             }
+            setTimeout(async () => {
+                try {
+                    const resp = await bgServerFetch(base + '/health', {}, 'text');
+                    if (resp.ok) return;
+                } catch (_) {}
+                alert(
+                    'サーバーがまだ応答しません。\n\n' +
+                    'フォルダを移した場合: install-server-protocol.bat を実行してからもう一度押してください。\n' +
+                    '手動: start_server_terminal.bat をダブルクリック'
+                );
+            }, 5000);
         });
     };
 
