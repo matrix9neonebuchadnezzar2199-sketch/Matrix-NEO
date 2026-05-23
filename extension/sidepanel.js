@@ -96,12 +96,58 @@ function buildCookieHeaderForDownload(pageUrl) {
   });
 }
 
-function fetchWithTimeout(url, options, timeoutMs) {
-    const ms = timeoutMs || FETCH_TIMEOUT_MS;
-    const controller = new AbortController();
-    const timer = setTimeout(function () { controller.abort(); }, ms);
-    const opts = Object.assign({}, options || {}, { signal: controller.signal });
-    return fetch(url, opts).finally(function () { clearTimeout(timer); });
+/** API 呼び出しは background 経由（sidepanel 直 fetch が失敗する環境対策） */
+function bgServerFetch(url, options, responseType) {
+    return new Promise(function (resolve, reject) {
+        chrome.runtime.sendMessage(
+            {
+                type: 'SERVER_FETCH',
+                url: url,
+                options: {
+                    method: (options && options.method) || 'GET',
+                    headers: (options && options.headers) || undefined,
+                    body: (options && options.body) || undefined,
+                },
+                timeoutMs: FETCH_TIMEOUT_MS,
+                responseType: responseType || 'text',
+            },
+            function (resp) {
+                if (chrome.runtime.lastError) {
+                    reject(new TypeError(chrome.runtime.lastError.message));
+                    return;
+                }
+                if (!resp) {
+                    reject(new TypeError('Failed to fetch'));
+                    return;
+                }
+                if (resp.error) {
+                    reject(new TypeError(resp.error));
+                    return;
+                }
+                resolve(resp);
+            }
+        );
+    });
+}
+
+function respToFetchLike(resp) {
+    const ok = resp.status >= 200 && resp.status < 300;
+    return {
+        ok: ok,
+        status: resp.status,
+        json: function () {
+            return Promise.resolve(JSON.parse(resp.body || '{}'));
+        },
+        blob: function () {
+            const bin = atob(resp.bodyBase64 || '');
+            const bytes = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            return Promise.resolve(new Blob([bytes], { type: resp.contentType || 'image/jpeg' }));
+        },
+        text: function () {
+            return Promise.resolve(resp.body || '');
+        },
+    };
 }
 
 /** サーバー Offline 時は CDN 直リンクを試す（プロキシ不要なホスト向け） */
@@ -192,20 +238,23 @@ async function loadProxiedThumbnails() {
     }
 }
 
-/** Fetch wrapper: Bearer + timeout; skips when server is offline (except /health). */
+/** Fetch wrapper: Bearer + background proxy; skips when server is offline (except /health). */
 function authFetch(url, options) {
     options = options || {};
     const isHealth = String(url).indexOf('/health') !== -1;
     if (!serverReachable && !isHealth) {
         return Promise.reject(new TypeError('Server offline'));
     }
-    if (authToken) {
-        options.headers = options.headers || {};
-        if (typeof options.headers === 'object' && !(options.headers instanceof Headers)) {
+    options.headers = options.headers || {};
+    if (typeof options.headers === 'object' && !(options.headers instanceof Headers)) {
+        if (authToken) {
             options.headers['Authorization'] = 'Bearer ' + authToken;
         }
     }
-    return fetchWithTimeout(url, options, FETCH_TIMEOUT_MS);
+    const isBlob = String(url).indexOf('/proxy-image') !== -1;
+    return bgServerFetch(url, options, isBlob ? 'blob' : 'text').then(function (resp) {
+        return respToFetchLike(resp);
+    });
 }
 
 // === SSE Connection for real-time task updates ===
@@ -335,12 +384,12 @@ async function init() {
         });
     };
 
-    document.getElementById('testConnection').onclick = async () => {
+    document.getElementById('testConnection').onclick = async function () {
         try {
-            const res = await fetch(serverUrl + '/health');
-            alert(res.ok ? 'OK!' : 'Failed');
+            const resp = await bgServerFetch(normalizeServerUrl(serverUrl) + '/health', {}, 'text');
+            alert(resp.status === 200 ? 'OK! Server reachable.' : 'HTTP ' + resp.status);
         } catch (e) {
-            alert('Error: ' + e.message);
+            alert('Error: ' + e.message + '\n\nServer URL: ' + serverUrl);
         }
     };
 
@@ -390,9 +439,8 @@ async function checkServer() {
         return false;
     }
     try {
-        const res = await fetchWithTimeout(base + '/health', {}, 5000);
-        await res.json();
-        serverReachable = res.ok;
+        const resp = await bgServerFetch(base + '/health', {}, 'text');
+        serverReachable = resp.status === 200;
         if (el) {
             el.textContent = res.ok ? 'Online' : 'Error';
             el.className = 'status ' + (res.ok ? 'online' : 'offline');

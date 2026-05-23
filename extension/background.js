@@ -142,6 +142,49 @@ const FALLBACK_AUDIO_QUALITIES = [
 
 const MAX_ANALYZE_TABS = 2;
 
+/**
+ * Side panel → localhost fetch is flaky on some Chrome builds; proxy via service worker.
+ */
+function handleServerFetch(message, sendResponse) {
+    (async () => {
+        const timeoutMs = message.timeoutMs || 12000;
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+            const opts = message.options || {};
+            const res = await fetch(message.url, {
+                method: opts.method || 'GET',
+                headers: opts.headers,
+                body: opts.body,
+                signal: controller.signal,
+            });
+            if (message.responseType === 'blob') {
+                const buf = await res.arrayBuffer();
+                const bytes = new Uint8Array(buf);
+                let binary = '';
+                const chunk = 0x8000;
+                for (let i = 0; i < bytes.length; i += chunk) {
+                    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+                }
+                sendResponse({
+                    ok: res.ok,
+                    status: res.status,
+                    bodyBase64: btoa(binary),
+                    contentType: res.headers.get('content-type') || 'application/octet-stream',
+                });
+            } else {
+                const body = await res.text();
+                sendResponse({ ok: res.ok, status: res.status, body });
+            }
+        } catch (e) {
+            sendResponse({ ok: false, error: e.message || String(e) });
+        } finally {
+            clearTimeout(timer);
+        }
+    })();
+    return true;
+}
+
 class VideoDetector {
     constructor() {
         this.detectedVideos = new Map();
@@ -913,6 +956,9 @@ class VideoDetector {
 
     handleMessage(message, sender, sendResponse) {
         switch (message.type) {
+            case 'SERVER_FETCH':
+                return handleServerFetch(message, sendResponse);
+
             case 'GET_VIDEOS':
                 sendResponse({ videos: Array.from(this.detectedVideos.values()) });
                 break;
