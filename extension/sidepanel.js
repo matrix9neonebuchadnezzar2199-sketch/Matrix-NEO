@@ -3,7 +3,8 @@
 /** Windows: register-server-protocol.reg 登録後、cmd /k で run_server を起動 */
 const MATRIX_NEO_SERVER_LAUNCH_URL = 'matrixneo://run-server/';
 
-let serverUrl = 'http://localhost:6850';
+/** 既定は 127.0.0.1（Windows で localhost→::1 になりサーバーに届かないことがある） */
+let serverUrl = 'http://127.0.0.1:6850';
 let authToken = '';
 let detectedVideos = new Map();
 let downloadTasks = new Map();
@@ -22,6 +23,11 @@ const THUMB_PROXY_CONCURRENCY = 2;
 const FETCH_TIMEOUT_MS = 12000;
 
 // Utility functions are loaded from utils.js
+
+function normalizeServerUrl(url) {
+    const u = (url || '').trim() || 'http://127.0.0.1:6850';
+    return u.replace(/^http:\/\/localhost\b/i, 'http://127.0.0.1').replace(/\/$/, '');
+}
 
 function videoListKey(video) {
     if (!video || !video.url) return '';
@@ -111,6 +117,7 @@ function applyDirectThumbnails() {
 }
 
 async function proxyOneThumbnail(img, base) {
+    if (!serverReachable) return;
     const thumbUrl = img.getAttribute('data-thumb-url');
     const card = img.closest('.video-card');
     if (!card || !thumbUrl) return;
@@ -263,10 +270,11 @@ document.addEventListener('DOMContentLoaded', () => {
 async function init() {
     try {
         const result = await chrome.storage.local.get(['serverUrl', 'savedList', 'authToken']);
-        if (result.serverUrl) serverUrl = result.serverUrl;
+        if (result.serverUrl) serverUrl = normalizeServerUrl(result.serverUrl);
+        else serverUrl = normalizeServerUrl(serverUrl);
+        document.getElementById('serverUrl').value = serverUrl;
         if (result.savedList) savedList = result.savedList;
         if (result.authToken) authToken = result.authToken;
-        document.getElementById('serverUrl').value = serverUrl;
     } catch (e) {}
 
     document.getElementById('startServerBtn').onclick = () => {
@@ -274,7 +282,7 @@ async function init() {
             if (chrome.runtime.lastError) {
                 alert(
                     'サーバー起動用リンクを開けませんでした: ' + chrome.runtime.lastError.message +
-                    '\n\n初回は extension フォルダの register-server-protocol.reg をダブルクリックしてレジストリに取り込んでください。'
+                    '\n\nフォルダ移動後は install-server-protocol.bat を1回実行してください。'
                 );
             }
         });
@@ -315,7 +323,8 @@ async function init() {
     };
 
     document.getElementById('saveSettings').onclick = async () => {
-        serverUrl = document.getElementById('serverUrl').value;
+        serverUrl = normalizeServerUrl(document.getElementById('serverUrl').value);
+        document.getElementById('serverUrl').value = serverUrl;
         const tokenInput = document.getElementById('authToken');
         if (tokenInput) authToken = tokenInput.value.trim();
         await chrome.storage.local.set({ serverUrl, authToken });

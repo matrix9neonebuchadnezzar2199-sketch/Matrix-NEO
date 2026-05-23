@@ -2,7 +2,7 @@
 
 class MatrixM {
   constructor() {
-    this.serverUrl = 'http://localhost:6850';
+    this.serverUrl = 'http://127.0.0.1:6850';
     this.detectedVideos = [];
     this.init();
   }
@@ -18,7 +18,7 @@ class MatrixM {
     try {
       const result = await chrome.storage.local.get(['serverUrl', 'authToken']);
       if (result.serverUrl) {
-        this.serverUrl = result.serverUrl;
+        this.serverUrl = result.serverUrl.replace(/^http:\/\/localhost\b/i, 'http://127.0.0.1');
         document.getElementById('serverUrl').value = this.serverUrl;
       }
       this.authToken = result.authToken || '';

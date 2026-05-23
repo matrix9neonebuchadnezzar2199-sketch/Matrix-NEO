@@ -29,9 +29,10 @@ function getCookieHeaderForUrl(pageUrl, callback) {
 async function getServerUrl() {
     try {
         const result = await chrome.storage.local.get(['serverUrl']);
-        return result.serverUrl || 'http://localhost:6850';
+        const u = result.serverUrl || 'http://127.0.0.1:6850';
+        return u.replace(/^http:\/\/localhost\b/i, 'http://127.0.0.1').replace(/\/$/, '');
     } catch {
-        return 'http://localhost:6850';
+        return 'http://127.0.0.1:6850';
     }
 }
 
