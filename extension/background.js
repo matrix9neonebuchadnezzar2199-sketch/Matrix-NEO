@@ -141,6 +141,7 @@ const FALLBACK_AUDIO_QUALITIES = [
 ];
 
 const MAX_ANALYZE_TABS = 2;
+const SESSION_VIDEOS_KEY = 'matrixNeoDetectedVideos';
 
 /**
  * Side panel → localhost fetch is flaky on some Chrome builds; proxy via service worker.
@@ -152,9 +153,13 @@ function handleServerFetch(message, sendResponse) {
         const timer = setTimeout(() => controller.abort(), timeoutMs);
         try {
             const opts = message.options || {};
+            const headers = Object.assign({}, opts.headers || {});
+            if (message.authToken) {
+                headers['Authorization'] = 'Bearer ' + message.authToken;
+            }
             const res = await fetch(message.url, {
                 method: opts.method || 'GET',
-                headers: opts.headers,
+                headers: headers,
                 body: opts.body,
                 signal: controller.signal,
             });
@@ -205,6 +210,32 @@ class VideoDetector {
         this._analyzeRunning = Math.max(0, this._analyzeRunning - 1);
     }
 
+    async _persistSessionVideos() {
+        try {
+            await chrome.storage.session.set({
+                [SESSION_VIDEOS_KEY]: Array.from(this.detectedVideos.entries()),
+            });
+        } catch (e) {
+            console.warn('[MATRIX-M] session persist:', e.message);
+        }
+    }
+
+    async _restoreSessionVideos() {
+        try {
+            const data = await chrome.storage.session.get([SESSION_VIDEOS_KEY]);
+            const entries = data[SESSION_VIDEOS_KEY];
+            if (!Array.isArray(entries)) return;
+            for (const [key, video] of entries) {
+                if (!this.detectedVideos.has(key)) {
+                    this.detectedVideos.set(key, video);
+                }
+            }
+            this.updateBadge();
+        } catch (e) {
+            console.warn('[MATRIX-M] session restore:', e.message);
+        }
+    }
+
     _removeMatrixQueueItem(itemId) {
         chrome.storage.local.get(['matrixQueue'], (result) => {
             const q = (result.matrixQueue || []).filter((i) => i.id !== itemId);
@@ -213,9 +244,10 @@ class VideoDetector {
     }
 
     init() {
-        chrome.action.onClicked.addListener((tab) => {
-            chrome.sidePanel.open({ tabId: tab.id });
-        });
+        this._restoreSessionVideos().then(() => {
+            chrome.action.onClicked.addListener((tab) => {
+                chrome.sidePanel.open({ tabId: tab.id });
+            });
 
         chrome.webRequest.onCompleted.addListener(
             (details) => this.handleRequest(details),
@@ -245,6 +277,7 @@ class VideoDetector {
         });
 
         console.log('[MATRIX-M] Background initialized');
+        });
     }
 
     /**
@@ -488,8 +521,7 @@ class VideoDetector {
         const urlLower = url.toLowerCase();
         let isHls =
             urlLower.includes('.m3u8') ||
-            /\/hls\//i.test(url) ||
-            /\/(?:playlist|manifest|index)(?:\.m3u8)?(?:\?|$)/i.test(url);
+            /\/hls\/[^/?#]+\.m3u8/i.test(url);
         let isDash = urlLower.includes('.mpd');
         let isProg = this.isProgressiveFileUrl(url);
 
@@ -936,6 +968,7 @@ class VideoDetector {
             const toRemove = entries.slice(0, entries.length - this.MAX_VIDEOS);
             toRemove.forEach(([key]) => this.detectedVideos.delete(key));
         }
+        this._persistSessionVideos();
     }
 
     clearTabVideos(tabId) {
@@ -946,6 +979,7 @@ class VideoDetector {
         }
         this.processedUrls.delete(tabId);
         this.updateBadge();
+        this._persistSessionVideos();
     }
 
     updateBadge() {
@@ -1078,6 +1112,7 @@ class VideoDetector {
                 this.detectedVideos.clear();
                 this.processedUrls.clear();
                 this.updateBadge();
+                this._persistSessionVideos();
                 sendResponse({ success: true });
                 break;
 

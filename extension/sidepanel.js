@@ -19,6 +19,10 @@ let serverWasReachable = false;
 let thumbProxyInFlight = false;
 let thumbProxyQueued = false;
 let thumbProxyWarnedOffline = false;
+/** @type {Set<string>} task_ids already written to downloadHistory */
+const completedTaskHistoryIds = new Set();
+let sseRetryMs = 3000;
+const SSE_RETRY_MAX_MS = 60000;
 const THUMB_PROXY_CONCURRENCY = 2;
 const FETCH_TIMEOUT_MS = 12000;
 
@@ -103,6 +107,7 @@ function bgServerFetch(url, options, responseType) {
             {
                 type: 'SERVER_FETCH',
                 url: url,
+                authToken: authToken || undefined,
                 options: {
                     method: (options && options.method) || 'GET',
                     headers: (options && options.headers) || undefined,
@@ -277,6 +282,10 @@ function connectSSE() {
     const es = new EventSource(sseUrl);
     sseConnection = es;
 
+    es.onopen = function () {
+        sseRetryMs = 3000;
+    };
+
     es.addEventListener('task-update', (e) => {
         try {
             const task = JSON.parse(e.data);
@@ -285,12 +294,8 @@ function connectSSE() {
             const statusChanged = existing && existing.status !== task.status;
             downloadTasks.set(task.task_id, task);
 
-            // Process newly completed tasks
             if (task.status === 'completed' && task.filename && (isNew || statusChanged)) {
-                addToSavedList(task.filename);
-                addToHistory(task);
-                updateSavedListDisplay();
-                removeCompletedFromQueue(task.filename, task.url);
+                recordCompletedTask(task);
             }
             updateTasksOnly();
         } catch (err) {
@@ -309,8 +314,9 @@ function connectSSE() {
     es.onerror = () => {
         es.close();
         sseConnection = null;
-        // Reconnect after 3 seconds
-        setTimeout(connectSSE, 3000);
+        const delay = sseRetryMs;
+        sseRetryMs = Math.min(sseRetryMs * 2, SSE_RETRY_MAX_MS);
+        setTimeout(connectSSE, delay);
     };
 }
 
@@ -347,17 +353,23 @@ async function init() {
                 );
                 return;
             }
-            setTimeout(async () => {
-                try {
-                    const resp = await bgServerFetch(base + '/health', {}, 'text');
-                    if (resp.ok) return;
-                } catch (_) {}
+            (async function waitForServer() {
+                for (let i = 0; i < 15; i++) {
+                    await new Promise(function (r) { setTimeout(r, 1000); });
+                    try {
+                        const resp = await bgServerFetch(base + '/health', {}, 'text');
+                        if (resp.ok) {
+                            await checkServer();
+                            return;
+                        }
+                    } catch (_) {}
+                }
                 alert(
                     'サーバーがまだ応答しません。\n\n' +
                     'フォルダを移した場合: install-server-protocol.bat を実行してからもう一度押してください。\n' +
                     '手動: start_server_terminal.bat をダブルクリック'
                 );
-            }, 5000);
+            })();
         });
     };
 
@@ -604,31 +616,34 @@ function showQueueNotification(data) {
     setTimeout(() => notification.remove(), 2000);
 }
 
-function removeCompletedFromQueue(filename, url) {
-    console.log('[MATRIX-M] removeCompletedFromQueue called:', { filename, url });
-    
+function removeCompletedFromQueue(taskOrFilename, url) {
+    const task = typeof taskOrFilename === 'object' ? taskOrFilename : null;
+    const filename = task ? task.filename : taskOrFilename;
+    const taskId = task && task.task_id;
+    console.log('[MATRIX-M] removeCompletedFromQueue called:', { filename, url, taskId });
+
     const filenameBase = (filename || '').toLowerCase().replace('.mp4', '');
     let removed = false;
-    
-    // Remove from local detectedVideos
+
     for (const [key, video] of detectedVideos) {
+        if (taskId && video.lastTaskId === taskId) {
+            detectedVideos.delete(key);
+            removed = true;
+            break;
+        }
         const videoTitle = (video.title || '').toLowerCase();
-        if (videoTitle.includes(filenameBase) || 
+        if (videoTitle.includes(filenameBase) ||
             filenameBase.includes(videoTitle.substring(0, 30)) ||
-            video.url === url ||
-            (url && video.url && video.url.includes(url.split('/')[5]))) {
+            video.url === url) {
             detectedVideos.delete(key);
             console.log('[MATRIX-M] Removed from local detectedVideos:', video.title);
             removed = true;
             break;
         }
     }
-    
-    // Remove from background
+
     chrome.runtime.sendMessage({ type: 'REMOVE_VIDEO_BY_URL', url: url }).catch(() => {});
-    chrome.runtime.sendMessage({ type: 'REMOVE_VIDEO_BY_TITLE', title: filenameBase }).catch(() => {});
-    
-    // Remove from storage queue
+
     chrome.storage.local.get(['matrixQueue'], (result) => {
         const queue = result.matrixQueue || [];
         const filtered = queue.filter(item => {
@@ -639,10 +654,22 @@ function removeCompletedFromQueue(filename, url) {
             chrome.storage.local.set({ matrixQueue: filtered });
         }
     });
-    
+
     if (removed) {
         renderVideosOnly();
     }
+}
+
+async function recordCompletedTask(task) {
+    if (!task || !task.task_id) return;
+    if (completedTaskHistoryIds.has(task.task_id)) return;
+    completedTaskHistoryIds.add(task.task_id);
+    if (task.filename) {
+        await addToSavedList(task.filename);
+    }
+    await addToHistory(task);
+    updateSavedListDisplay();
+    removeCompletedFromQueue(task, task.url);
 }
 
 async function clearQueue() {
@@ -825,12 +852,9 @@ async function loadServerTasks() {
         const processedCompleted = new Set();
         for (const task of data.tasks) {
             if (task.status === 'completed' && task.filename && !processedCompleted.has(task.task_id)) {
-                if (!downloadTasks.has(task.task_id) || downloadTasks.get(task.task_id).status !== 'completed') {
-                    await addToSavedList(task.filename);
-                    await addToHistory(task);
-                    updateSavedListDisplay();
-                    processedCompleted.add(task.task_id);
-                    removeCompletedFromQueue(task.filename, task.url);
+                processedCompleted.add(task.task_id);
+                if (!completedTaskHistoryIds.has(task.task_id)) {
+                    await recordCompletedTask(task);
                 }
             }
         }
@@ -1193,7 +1217,8 @@ async function startDownload(video, url) {
             throw new Error('No task_id in response');
         }
 
-        removeDetectedByVideo(video);
+        const startedVideo = { ...video, lastTaskId: data.task_id };
+        removeDetectedByVideo(startedVideo);
         chrome.runtime.sendMessage({ type: 'REMOVE_VIDEO_BY_URL', url: video.url });
         await loadServerTasks();
         renderVideosOnly();
@@ -1333,7 +1358,14 @@ async function addToHistory(item) {
     try {
         const result = await chrome.storage.local.get(['downloadHistory']);
         downloadHistory = result.downloadHistory || [];
+        if (downloadHistory.some(function (h) {
+            return (h.task_id && h.task_id === item.task_id) ||
+                (h.filename === item.filename && h.url === item.url);
+        })) {
+            return;
+        }
         downloadHistory.push({
+            task_id: item.task_id,
             filename: item.filename,
             url: item.url,
             thumbnail_url: item.thumbnail_url,
