@@ -11,10 +11,9 @@ from fastapi import APIRouter, HTTPException
 from app import config as cfg
 from app.models import TaskState, TaskStatus
 from app.services import youtube_service
-from app.services.download_service import run_download
+from app.services.download_service import cleanup_hls_artifacts, run_download
 from app.services.task_dispatch import download_in_flight_key
-from app.state import tm
-from app.task_id import new_task_id
+from app.state import STOPPABLE_STATUSES, tm
 from app.utils.timeutil import utcnow_iso
 from app.utils.validation import validate_http_url
 
@@ -24,11 +23,19 @@ logger = logging.getLogger(__name__)
 _YTDLP_TYPES = frozenset({"youtube", "yt-dlp"})
 
 
-@router.post("/task/{task_id}/stop")
-async def stop_task(task_id: str):
+async def _stop_task_impl(task_id: str) -> dict:
     task = tm.get(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
+
+    if task.status not in STOPPABLE_STATUSES and task.status != TaskStatus.STOPPED:
+        tm.unregister_active_download(task_id)
+        return {
+            "status": "already_finished",
+            "task_id": task_id,
+            "task_status": task.status.value,
+            "can_resume": False,
+        }
 
     if task_id in tm.active_downloads:
         dl_task = tm.active_downloads[task_id]
@@ -39,79 +46,58 @@ async def stop_task(task_id: str):
             pass
         except Exception:
             logger.exception("stop_task await download")
-    tm.active_downloads.pop(task_id, None)
+    tm.unregister_active_download(task_id)
 
-    out = cfg.OUTPUT_DIR / task.filename
-    part = Path(str(out) + ".part")
-    if out.is_file():
-        try:
-            out.unlink()
-        except OSError as e:
-            logger.debug("stop remove output: %s", e)
-    if part.is_file():
-        logger.info("stop kept partial for resume: %s", part.name)
+    if task.status in STOPPABLE_STATUSES:
+        out = cfg.OUTPUT_DIR / task.filename
+        part = Path(str(out) + ".part")
+        if out.is_file():
+            try:
+                out.unlink()
+            except OSError as e:
+                logger.debug("stop remove output: %s", e)
+        if part.is_file():
+            logger.info("stop kept partial for resume: %s", part.name)
+        cleanup_hls_artifacts(task_id)
 
-    await tm.update(
-        task_id,
-        status=TaskStatus.STOPPED,
-        message="Stopped",
-        stopped_at=utcnow_iso(),
-    )
+        await tm.update(
+            task_id,
+            status=TaskStatus.STOPPED,
+            message="Stopped",
+            stopped_at=utcnow_iso(),
+        )
+        logger.info("Task stopped: %s", task_id)
+        return {"status": "stopped", "task_id": task_id, "can_resume": True}
 
-    logger.info("Task stopped: %s", task_id)
     return {"status": "stopped", "task_id": task_id, "can_resume": True}
 
 
-@router.post("/task/{task_id}/resume")
-async def resume_task(task_id: str):
-    cur = tm.get(task_id)
-    if not cur or cur.status != TaskStatus.STOPPED:
-        raise HTTPException(status_code=404, detail="Stopped task not found")
+@router.post("/task/{task_id}/stop")
+async def stop_task(task_id: str):
+    return await _stop_task_impl(task_id)
 
+
+async def _start_resumed_runner(task_id: str, cur: TaskState) -> None:
+    """Restart download for a stopped task, reusing the same task_id."""
     _, resolved_ips = validate_http_url(cur.url, block_private_ips=cfg.BLOCK_PRIVATE_IPS)
     cred = tm.task_credentials.get(task_id, {})
     ck, rk = cred.get("cookie"), cred.get("referer")
-    new_id = new_task_id()
     in_flight_key = download_in_flight_key(cur.url, cur.quality)
-    await tm.bind_in_flight(in_flight_key, new_id)
 
-    if cur.type in _YTDLP_TYPES:
-
-        async def _run_yt() -> None:
-            try:
+    async def _run() -> None:
+        try:
+            if cur.type in _YTDLP_TYPES:
                 await youtube_service.run_youtube_download(
-                    new_id,
+                    task_id,
                     cur.url,
                     cur.filename,
                     cur.format or "mp4",
                     cur.quality or "1080",
                     cur.thumbnail_url,
                 )
-            finally:
-                await tm.release_in_flight(in_flight_key, new_id)
-
-        await tm.register(
-            TaskState(
-                task_id=new_id,
-                status=TaskStatus.QUEUED,
-                progress=0.0,
-                filename=cur.filename,
-                message="Resuming...",
-                url=cur.url,
-                type=cur.type,
-                quality=cur.quality,
-                thumbnail_url=cur.thumbnail_url,
-                format=cur.format,
-                created_at=utcnow_iso(),
-            ),
-        )
-        t = asyncio.create_task(_run_yt())
-    else:
-
-        async def _run_hls() -> None:
-            try:
+            else:
                 await run_download(
-                    new_id,
+                    task_id,
                     cur.url,
                     cur.filename,
                     cur.thumbnail_url,
@@ -120,42 +106,61 @@ async def resume_task(task_id: str):
                     rk,
                     resolved_ips=resolved_ips,
                 )
-            finally:
-                await tm.release_in_flight(in_flight_key, new_id)
+        finally:
+            await tm.release_in_flight(in_flight_key, task_id)
+            tm.unregister_active_download(task_id)
 
-        await tm.register(
-            TaskState(
-                task_id=new_id,
-                status=TaskStatus.QUEUED,
-                progress=0.0,
-                filename=cur.filename,
-                message="Resuming...",
-                url=cur.url,
-                type=cur.type or "hls",
-                quality=cur.quality,
-                thumbnail_url=cur.thumbnail_url,
-                created_at=utcnow_iso(),
-            ),
-            credentials={"cookie": ck, "referer": rk},
+    tm.active_downloads[task_id] = asyncio.create_task(_run())
+
+
+@router.post("/task/{task_id}/resume")
+async def resume_task(task_id: str):
+    cur = tm.get(task_id)
+    if not cur or cur.status != TaskStatus.STOPPED:
+        raise HTTPException(status_code=404, detail="Stopped task not found")
+
+    if task_id in tm.active_downloads:
+        raise HTTPException(status_code=409, detail="Task already running")
+
+    in_flight_key = download_in_flight_key(cur.url, cur.quality)
+    existing = await tm.find_in_flight_task(in_flight_key)
+    if existing is not None and existing.task_id != task_id:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Another download in flight: {existing.task_id}",
         )
-        t = asyncio.create_task(_run_hls())
 
-    tm.active_downloads[new_id] = t
-    await tm.remove(task_id)
+    cleanup_hls_artifacts(task_id)
+    await tm.bind_in_flight(in_flight_key, task_id)
+    await tm.update(
+        task_id,
+        status=TaskStatus.QUEUED,
+        progress=0.0,
+        message="Resuming...",
+        stopped_at=None,
+    )
 
-    logger.info("Task resumed: %s -> %s", task_id, new_id)
-    return {"status": "resumed", "old_task_id": task_id, "new_task_id": new_id}
+    await _start_resumed_runner(task_id, cur)
+    logger.info("Task resumed: %s", task_id)
+    return {"status": "resumed", "task_id": task_id}
 
 
 @router.post("/tasks/stop-all")
 async def stop_all_tasks():
-    stopped_count = 0
-    for tid in list(tm.active_downloads.keys()):
-        try:
-            await stop_task(tid)
-            stopped_count += 1
-        except Exception:
-            logger.exception("stop-all: %s", tid)
+    tids = list(tm.active_downloads.keys())
+    if not tids:
+        return {"status": "ok", "stopped_count": 0}
+
+    results = await asyncio.gather(
+        *(_stop_task_impl(tid) for tid in tids),
+        return_exceptions=True,
+    )
+    stopped_count = sum(
+        1 for r in results if isinstance(r, dict) and r.get("status") == "stopped"
+    )
+    for r in results:
+        if isinstance(r, Exception) and not isinstance(r, HTTPException):
+            logger.exception("stop-all: %s", r)
     logger.info("stop-all: %s tasks", stopped_count)
     return {"status": "ok", "stopped_count": stopped_count}
 
@@ -179,6 +184,8 @@ async def clear_finished_tasks():
         for task_id, t in tm.tasks.items()
         if t.status in (TaskStatus.COMPLETED, TaskStatus.ERROR)
     ]
+    for tid in cleared:
+        tm.unregister_active_download(tid)
     n = await tm.remove_many(cleared)
     logger.info("clear-finished: %s tasks", n)
     return {"status": "ok", "cleared_count": n}

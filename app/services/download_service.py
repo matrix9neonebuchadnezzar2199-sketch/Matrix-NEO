@@ -83,6 +83,25 @@ class M3u8StallMonitor:
         return False
 
 
+def hls_save_name_for_task(task_id: str) -> str:
+    """N_m3u8DL-RE --save-name prefix for a task."""
+    return "mneo_" + re.sub(r"[^0-9A-Za-z_]+", "_", task_id).strip("_")
+
+
+def cleanup_hls_artifacts(task_id: str) -> None:
+    """Remove N_m3u8DL-RE intermediate files for a task (not the user-facing output name)."""
+    save_name = hls_save_name_for_task(task_id)
+    for base in (str(cfg.OUTPUT_DIR), str(cfg.TEMP_DIR)):
+        for ext in (".ts", ".mp4", ".m4s", ".mkv"):
+            path = os.path.join(base, save_name + ext)
+            if os.path.isfile(path):
+                try:
+                    os.remove(path)
+                    logger.debug("Removed HLS artifact: %s", path)
+                except OSError as e:
+                    logger.debug("HLS artifact remove failed %s: %s", path, e)
+
+
 async def terminate_child_process(proc: asyncio.subprocess.Process) -> None:
     if proc.returncode is not None:
         return
@@ -158,6 +177,7 @@ async def _run_progressive(
 
     dest_str = str(output_path)
     tmp = dest_str + ".part"
+    last_progress_at = 0.0
 
     # --- HTTP Range resume: reuse existing .part file ---
     existing_bytes = 0
@@ -196,17 +216,23 @@ async def _run_progressive(
                     f.write(chunk)
                     downloaded += len(chunk)
                     if total > 0:
-                        p = min(
+                        now = time.monotonic()
+                        pct = min(
                             PROGRESS_DIRECT_DL_CAP,
                             int(downloaded * PROGRESS_DIRECT_DL_CAP / total),
                         )
-                        await tm.update(task_id, progress=float(p))
+                        if now - last_progress_at >= 0.5 or downloaded >= total:
+                            last_progress_at = now
+                            await tm.update(task_id, progress=float(pct))
                     else:
                         mb = downloaded // (1024 * 1024)
-                        await tm.update(
-                            task_id,
-                            progress=float(min(PROGRESS_DIRECT_DL_CAP, 5 + mb * 3)),
-                        )
+                        now = time.monotonic()
+                        if now - last_progress_at >= 0.5:
+                            last_progress_at = now
+                            await tm.update(
+                                task_id,
+                                progress=float(min(PROGRESS_DIRECT_DL_CAP, 5 + mb * 3)),
+                            )
             if downloaded < MIN_VALID_FILE_BYTES:
                 logger.warning("direct file too small: %s bytes", downloaded)
                 try:
@@ -339,7 +365,7 @@ async def _run_m3u8(
 ) -> tuple[Optional[Path], bool]:
     """Run N_m3u8DL-RE; returns (media path or None, killed_stall)."""
     base_name = filename.rsplit(".", 1)[0]
-    save_name_dl = "mneo_" + re.sub(r"[^0-9A-Za-z_]+", "_", task_id).strip("_")
+    save_name_dl = hls_save_name_for_task(task_id)
 
     def _build_m3u8_cmd(use_mt: bool) -> list[str]:
         out_dir = str(cfg.OUTPUT_DIR)
@@ -667,10 +693,15 @@ async def run_download(
             return
 
         filename = sanitize_filename_for_windows(filename)
-        await tm.update(task_id, filename=filename, status=TaskStatus.DOWNLOADING, message="Starting...")
         output_path = cfg.OUTPUT_DIR / filename
 
         async with tm.semaphore:
+            await tm.update(
+                task_id,
+                filename=filename,
+                status=TaskStatus.DOWNLOADING,
+                message="Starting...",
+            )
             if is_direct_progressive_http_url(url):
                 await tm.update(task_id, message="Downloading (HTTP)...")
                 raw = await _run_progressive(

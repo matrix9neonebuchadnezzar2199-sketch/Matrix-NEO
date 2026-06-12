@@ -32,4 +32,5 @@ def test_resume_hls_revalidates_url_and_passes_resolved_ips(monkeypatch):
     with TestClient(app, raise_server_exceptions=False) as client:
         r = client.post(f"/task/{tid}/resume")
     assert r.status_code == 200
+    assert r.json()["task_id"] == tid
     assert captured.get("kwargs", {}).get("resolved_ips") == ["192.0.2.1"]

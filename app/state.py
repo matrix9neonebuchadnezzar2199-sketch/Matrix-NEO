@@ -9,7 +9,7 @@ from app import config as cfg
 from app.models import TaskState, TaskStatus
 
 
-_ACTIVE_STATUSES = frozenset(
+ACTIVE_STATUSES = frozenset(
     {
         TaskStatus.QUEUED,
         TaskStatus.DOWNLOADING,
@@ -17,6 +17,9 @@ _ACTIVE_STATUSES = frozenset(
         TaskStatus.THUMBNAIL,
     }
 )
+
+# 停止操作でファイル削除してよい状態
+STOPPABLE_STATUSES = ACTIVE_STATUSES
 
 
 class TaskManager:
@@ -57,10 +60,33 @@ class TaskManager:
             if not tid:
                 return None
             task = self.tasks.get(tid)
-            if task is None or task.status not in _ACTIVE_STATUSES:
+            if task is None or task.status not in ACTIVE_STATUSES:
                 self._in_flight.pop(key, None)
                 return None
             return task
+
+    async def register_and_bind_in_flight(
+        self,
+        key: str,
+        task: TaskState,
+        credentials: Optional[dict[str, str | None]] = None,
+    ) -> Optional[TaskState]:
+        """Atomically dedup-check, register task, and bind in-flight key."""
+        async with self._lock:
+            tid = self._in_flight.get(key)
+            if tid:
+                existing = self.tasks.get(tid)
+                if existing is not None and existing.status in ACTIVE_STATUSES:
+                    return existing
+                self._in_flight.pop(key, None)
+            self.tasks[task.task_id] = task
+            if credentials:
+                self.task_credentials[task.task_id] = credentials
+            self._in_flight[key] = task.task_id
+            return None
+
+    def unregister_active_download(self, task_id: str) -> None:
+        self.active_downloads.pop(task_id, None)
 
     async def bind_in_flight(self, key: str, task_id: str) -> None:
         async with self._lock:

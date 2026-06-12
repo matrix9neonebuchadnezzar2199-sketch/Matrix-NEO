@@ -15,15 +15,6 @@ from app.utils.url_normalize import normalize_download_url
 
 logger = logging.getLogger(__name__)
 
-_ACTIVE_STATUSES = frozenset(
-    {
-        TaskStatus.QUEUED,
-        TaskStatus.DOWNLOADING,
-        TaskStatus.MERGING,
-        TaskStatus.THUMBNAIL,
-    }
-)
-
 
 def download_in_flight_key(url: str, quality: Optional[str] = None) -> str:
     q = (quality or "").strip()
@@ -52,21 +43,12 @@ async def queue_download_task(
     Register a task, bind in-flight key, and start asyncio runner.
     Returns API payload; sets deduplicated=True when reusing an active task.
     """
-    existing = await find_active_task_for_url(url, quality)
-    if existing is not None:
-        logger.info("Dedup download: %s -> %s", url[:60], existing.task_id)
-        return {
-            "task_id": existing.task_id,
-            "status": existing.status.value,
-            "filename": existing.filename,
-            "deduplicated": True,
-        }
-
     task_id = new_task_id()
     filename = unique_output_filename(requested_filename, task_id, ext=ext)
     in_flight_key = download_in_flight_key(url, quality)
 
-    await tm.register(
+    existing = await tm.register_and_bind_in_flight(
+        in_flight_key,
         TaskState(
             task_id=task_id,
             url=url,
@@ -82,13 +64,21 @@ async def queue_download_task(
         ),
         credentials=credentials,
     )
-    await tm.bind_in_flight(in_flight_key, task_id)
+    if existing is not None:
+        logger.info("Dedup download: %s -> %s", url[:60], existing.task_id)
+        return {
+            "task_id": existing.task_id,
+            "status": existing.status.value,
+            "filename": existing.filename,
+            "deduplicated": True,
+        }
 
     async def _run() -> None:
         try:
             await runner(task_id, filename)
         finally:
             await tm.release_in_flight(in_flight_key, task_id)
+            tm.unregister_active_download(task_id)
 
     task = asyncio.create_task(_run())
     tm.active_downloads[task_id] = task

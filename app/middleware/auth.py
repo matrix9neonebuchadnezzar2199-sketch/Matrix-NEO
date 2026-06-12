@@ -9,6 +9,7 @@ When the token is empty the middleware is a no-op (backward compatible).
 
 from __future__ import annotations
 
+import hmac
 import logging
 from typing import Callable
 
@@ -34,13 +35,14 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         if path in _PUBLIC_PATHS:
             return await call_next(request)
 
-        # Check Authorization header
+        # Check Authorization header (constant-time compare)
         auth = request.headers.get("authorization", "")
-        if auth.startswith("Bearer ") and auth[7:] == token:
+        if auth.startswith("Bearer ") and hmac.compare_digest(auth[7:], token):
             return await call_next(request)
 
         # Fallback: query parameter (useful for SSE EventSource)
-        if request.query_params.get("token") == token:
+        query_token = request.query_params.get("token") or ""
+        if query_token and hmac.compare_digest(query_token, token):
             return await call_next(request)
 
         logger.warning("Auth rejected: %s %s from %s", request.method, path,

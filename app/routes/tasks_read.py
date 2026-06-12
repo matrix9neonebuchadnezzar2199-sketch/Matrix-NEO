@@ -32,7 +32,7 @@ async def get_status(task_id: str):
 async def delete_task(task_id: str):
     if task_id in tm.active_downloads:
         tm.active_downloads[task_id].cancel()
-        del tm.active_downloads[task_id]
+        tm.unregister_active_download(task_id)
     if await tm.remove(task_id) is not None:
         return {"status": "deleted"}
     raise HTTPException(status_code=404, detail="Task not found")
