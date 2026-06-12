@@ -23,6 +23,7 @@ let thumbProxyWarnedOffline = false;
 const completedTaskHistoryIds = new Set();
 let sseRetryMs = 3000;
 const SSE_RETRY_MAX_MS = 60000;
+const SERVER_LAUNCH_WAIT_SEC = 45;
 const THUMB_PROXY_CONCURRENCY = 2;
 const FETCH_TIMEOUT_MS = 12000;
 
@@ -243,14 +244,95 @@ async function loadProxiedThumbnails() {
     }
 }
 
+/** Apply reachability flag and refresh dependent UI (SSE, status pill). */
+function applyServerReachability(online) {
+    const el = document.getElementById('serverStatus');
+    serverReachable = !!online;
+    if (el) {
+        el.textContent = serverReachable ? 'Online' : 'Offline';
+        el.className = 'status ' + (serverReachable ? 'online' : 'offline');
+    }
+    if (serverReachable && !serverWasReachable) {
+        connectSSE();
+        loadServerTasks().catch(function () {});
+    } else if (!serverReachable && serverWasReachable) {
+        if (sseConnection) {
+            sseConnection.close();
+            sseConnection = null;
+        }
+    }
+    serverWasReachable = serverReachable;
+}
+
+/** Read background health poll result from storage (canonical when fresh). */
+async function syncServerReachabilityFromStorage() {
+    try {
+        const stored = await chrome.storage.local.get([
+            'matrixNeoServerOnline',
+            'matrixNeoServerCheckedAt',
+            'matrixNeoServerUrl',
+        ]);
+        const ageMs = Date.now() - (stored.matrixNeoServerCheckedAt || 0);
+        const base = normalizeServerUrl(serverUrl);
+        const urlMatch = !stored.matrixNeoServerUrl || stored.matrixNeoServerUrl === base;
+        if (ageMs < 15000 && urlMatch && stored.matrixNeoServerOnline === true) {
+            applyServerReachability(true);
+            return true;
+        }
+        if (ageMs < 15000 && urlMatch && stored.matrixNeoServerOnline === false) {
+            applyServerReachability(false);
+            return false;
+        }
+    } catch (e) {}
+    return null;
+}
+
+function pingBackgroundHealth() {
+    return new Promise(function (resolve) {
+        chrome.runtime.sendMessage({ type: 'PING_SERVER_HEALTH' }, function (resp) {
+            if (chrome.runtime.lastError) {
+                resolve(false);
+                return;
+            }
+            resolve(resp && resp.online === true);
+        });
+    });
+}
+
+/** Wait up to SERVER_LAUNCH_WAIT_SEC after matrixneo:// launch. */
+async function waitForServerAfterLaunch() {
+    pingBackgroundHealth().catch(function () {});
+    for (let i = 0; i < SERVER_LAUNCH_WAIT_SEC; i++) {
+        await new Promise(function (r) { setTimeout(r, 1000); });
+        const synced = await syncServerReachabilityFromStorage();
+        if (synced === true) return true;
+        if (i % 3 === 2) {
+            await pingBackgroundHealth();
+            const again = await syncServerReachabilityFromStorage();
+            if (again === true) return true;
+        }
+        try {
+            const resp = await bgServerFetch(normalizeServerUrl(serverUrl) + '/health', {}, 'text');
+            if (resp.ok) {
+                applyServerReachability(true);
+                return true;
+            }
+        } catch (_) {}
+    }
+    return false;
+}
+
 /** Fetch wrapper: Bearer + background proxy; re-probes /health if flag is stale. */
 function authFetch(url, options) {
     options = options || {};
     const isHealth = String(url).indexOf('/health') !== -1;
     if (!serverReachable && !isHealth) {
-        return checkServer().then(function (ok) {
-            if (!ok) return Promise.reject(new TypeError('Server offline'));
-            return authFetch(url, options);
+        return syncServerReachabilityFromStorage().then(function (synced) {
+            if (synced === true) return authFetch(url, options);
+            return checkServer().then(function (ok) {
+                if (!ok) return Promise.reject(new TypeError('Server offline'));
+                return authFetch(url, options);
+            });
         });
     }
     options.headers = options.headers || {};
@@ -354,16 +436,8 @@ async function init() {
                 return;
             }
             (async function waitForServer() {
-                for (let i = 0; i < 15; i++) {
-                    await new Promise(function (r) { setTimeout(r, 1000); });
-                    try {
-                        const resp = await bgServerFetch(base + '/health', {}, 'text');
-                        if (resp.ok) {
-                            await checkServer();
-                            return;
-                        }
-                    } catch (_) {}
-                }
+                const ok = await waitForServerAfterLaunch();
+                if (ok) return;
                 alert(
                     'サーバーがまだ応答しません。\n\n' +
                     'フォルダを移した場合: install-server-protocol.bat を実行してからもう一度押してください。\n' +
@@ -415,7 +489,9 @@ async function init() {
         await chrome.storage.local.set({ serverUrl, authToken });
         document.getElementById('settingsModal').classList.remove('show');
         serverWasReachable = false;
-        checkServer().then(function (ok) {
+        pingBackgroundHealth().then(function () {
+            return checkServer();
+        }).then(function (ok) {
             if (ok) connectSSE();
         });
     };
@@ -444,11 +520,29 @@ async function init() {
             alert('Queue failed: ' + (msg.data?.error || 'unknown'));
             loadQueuedVideos();
         }
+        if (msg.type === 'SERVER_REACHABILITY') {
+            const base = normalizeServerUrl(serverUrl);
+            if (!msg.serverUrl || msg.serverUrl === base) {
+                applyServerReachability(!!msg.online);
+            }
+        }
         sendResponse({ok: true});
         return true;
     });
 
-    await checkServer();
+    chrome.storage.onChanged.addListener(function (changes, area) {
+        if (area !== 'local') return;
+        if (changes.matrixNeoServerOnline || changes.matrixNeoServerCheckedAt) {
+            syncServerReachabilityFromStorage();
+        }
+    });
+
+    await syncServerReachabilityFromStorage();
+    await pingBackgroundHealth();
+    await syncServerReachabilityFromStorage();
+    if (!serverReachable) {
+        await checkServer();
+    }
     if (serverReachable) {
         await loadServerTasks();
         connectSSE();
@@ -459,46 +553,29 @@ async function init() {
     // Fallback: poll tasks slowly (SSE is primary)
     setInterval(loadServerTasks, 30000);
     setInterval(loadVideos, 5000);
-    setInterval(checkServer, 10000);
+    setInterval(function () {
+        pingBackgroundHealth().then(function () { return syncServerReachabilityFromStorage(); });
+    }, 10000);
     setInterval(checkVpnStatus, 30000);
 }
 
 async function checkServer() {
-    const el = document.getElementById('serverStatus');
-    const base = (serverUrl || '').replace(/\/$/, '');
+    const base = normalizeServerUrl(serverUrl);
     if (!base) {
-        serverReachable = false;
-        if (el) {
-            el.textContent = 'Offline';
-            el.className = 'status offline';
-        }
+        applyServerReachability(false);
         return false;
+    }
+    await pingBackgroundHealth();
+    const synced = await syncServerReachabilityFromStorage();
+    if (synced === true || synced === false) {
+        return synced;
     }
     try {
         const resp = await bgServerFetch(base + '/health', {}, 'text');
-        serverReachable = resp.status === 200;
-        if (el) {
-            el.textContent = serverReachable ? 'Online' : 'Error';
-            el.className = 'status ' + (serverReachable ? 'online' : 'offline');
-        }
+        applyServerReachability(resp.status === 200);
     } catch (e) {
-        serverReachable = false;
-        if (el) {
-            el.textContent = 'Offline';
-            el.className = 'status offline';
-        }
+        applyServerReachability(false);
     }
-
-    if (serverReachable && !serverWasReachable) {
-        connectSSE();
-        loadServerTasks().catch(function () {});
-    } else if (!serverReachable && serverWasReachable) {
-        if (sseConnection) {
-            sseConnection.close();
-            sseConnection = null;
-        }
-    }
-    serverWasReachable = serverReachable;
     return serverReachable;
 }
 

@@ -56,6 +56,79 @@ async function bgAuthFetch(url, options = {}) {
     return fetch(url, options);
 }
 
+const HEALTH_POLL_MS = 3000;
+const HEALTH_FETCH_TIMEOUT_MS = 5000;
+let _lastServerOnline = false;
+
+/** Canonical server reachability probe (runs in service worker, not sidepanel). */
+async function pollServerHealth() {
+    const serverUrl = await getServerUrl();
+    const base = serverUrl.replace(/\/$/, '');
+    let online = false;
+    let detail = '';
+    const controller = new AbortController();
+    const timer = setTimeout(function () { controller.abort(); }, HEALTH_FETCH_TIMEOUT_MS);
+    try {
+        const token = await getAuthToken();
+        const headers = { Accept: 'application/json' };
+        if (token) headers['Authorization'] = 'Bearer ' + token;
+        const res = await fetch(base + '/health', {
+            method: 'GET',
+            headers: headers,
+            cache: 'no-store',
+            signal: controller.signal,
+        });
+        online = res.status === 200;
+        if (!online) detail = 'HTTP ' + res.status;
+    } catch (e) {
+        detail = e && e.message ? e.message : String(e);
+    } finally {
+        clearTimeout(timer);
+    }
+
+    if (online !== _lastServerOnline) {
+        console.log('[MATRIX-M] Server', online ? 'online' : 'offline', base, detail || '');
+        _lastServerOnline = online;
+    }
+
+    try {
+        await chrome.storage.local.set({
+            matrixNeoServerOnline: online,
+            matrixNeoServerCheckedAt: Date.now(),
+            matrixNeoServerUrl: base,
+            matrixNeoServerDetail: detail,
+        });
+    } catch (e) {
+        console.warn('[MATRIX-M] health storage:', e.message);
+    }
+
+    chrome.runtime.sendMessage({
+        type: 'SERVER_REACHABILITY',
+        online: online,
+        serverUrl: base,
+        detail: detail,
+    }).catch(function () {});
+
+    return online;
+}
+
+function startHealthPolling() {
+    pollServerHealth();
+    setInterval(pollServerHealth, HEALTH_POLL_MS);
+}
+
+startHealthPolling();
+
+chrome.runtime.onMessage.addListener(function (message, _sender, sendResponse) {
+    if (message.type === 'PING_SERVER_HEALTH') {
+        pollServerHealth()
+            .then(function (online) { sendResponse({ online: online }); })
+            .catch(function (e) { sendResponse({ online: false, error: e.message }); });
+        return true;
+    }
+    return false;
+});
+
 /**
  * yt-dlp サイトの品質をサーバー /youtube/info 経由で動的取得。
  */
@@ -183,6 +256,9 @@ function handleServerFetch(message, sendResponse) {
             }
         } catch (e) {
             sendResponse({ ok: false, error: e.message || String(e) });
+            if (String(message.url || '').indexOf('/health') !== -1) {
+                console.warn('[MATRIX-M] SERVER_FETCH health failed:', message.url, e.message || e);
+            }
         } finally {
             clearTimeout(timer);
         }
