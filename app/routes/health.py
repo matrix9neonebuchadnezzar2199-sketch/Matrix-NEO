@@ -9,6 +9,7 @@ from fastapi import APIRouter
 
 from app import __version__
 from app import config as cfg
+from app.utils.ffmpeg_info import ffmpeg_health_fields
 from app.utils.timeutil import utcnow_iso
 
 router = APIRouter(tags=["health"])
@@ -17,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 @router.get("/health")
 async def health():
+    ff = await ffmpeg_health_fields()
     return {
         "status": "healthy",
         "timestamp": utcnow_iso(),
@@ -24,6 +26,7 @@ async def health():
         "product": "MATRIX-NEO",
         "threads": cfg.MAX_THREADS,
         "youtube": True,
+        **ff,
     }
 
 
